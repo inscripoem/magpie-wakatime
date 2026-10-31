@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 // Language names match WakaTime's own vocabulary (GET /api/v1/program_languages),
 // so a heartbeat's language joins the same series that file heartbeats create.
 const BY_EXTENSION = new Map(Object.entries({
@@ -82,17 +84,60 @@ const EXPLICIT_BY_EXTENSION = new Map(Object.entries({
 }));
 
 const EXPLICIT_BY_NAME = new Map(Object.entries({
-  dockerfile: "Docker", makefile: "Makefile", "cmakelists.txt": "CMake",
+  dockerfile: "Dockerfile", makefile: "Makefile", "cmakelists.txt": "CMake",
 }));
+
+// A snapshot of WakaTime's program language list ships with the plugin so it
+// works offline; index.mjs refreshes it from the API while the plugin runs.
+const SNAPSHOT = (() => {
+  try { return JSON.parse(readFileSync(new URL("./program-languages.json", import.meta.url), "utf8")); }
+  catch { return {}; }
+})();
+let REMOTE_EXTENSIONS = new Map(Object.entries(SNAPSHOT?.extensions ?? {}));
+const EXCLUDED_LANGUAGES = new Set(["Diff"]);
+
+export function setRemoteLanguages(extensions) {
+  const next = new Map();
+  if (extensions && typeof extensions === "object") {
+    for (const [extension, language] of Object.entries(extensions)) {
+      if (typeof extension !== "string" || typeof language !== "string") continue;
+      const key = extension.replace(/^\./, "").toLowerCase();
+      if (key) next.set(key, language);
+    }
+  }
+  REMOTE_EXTENSIONS = next;
+}
+
+export function remoteLanguages() {
+  return Object.fromEntries(REMOTE_EXTENSIONS);
+}
+
+// Longest suffix wins, so config.json.example is JSON and types.d.ts is
+// TypeScript even when the table has no entry for the whole name.
+function remoteLanguage(name) {
+  const direct = REMOTE_EXTENSIONS.get(name);
+  if (direct) return direct;
+  for (let index = name.indexOf("."); index >= 0; index = name.indexOf(".", index + 1)) {
+    if (index + 1 >= name.length) continue;
+    const language = REMOTE_EXTENSIONS.get(name.slice(index + 1));
+    if (language) return language;
+  }
+  return null;
+}
 
 export function languageForFile(value) {
   if (typeof value !== "string" || !value) return null;
   const path = value.split(/[?#]/)[0].replace(/\\/g, "/");
   const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
   const byName = EXPLICIT_BY_NAME.get(name);
-  if (byName) return byName;
+  if (byName) return EXCLUDED_LANGUAGES.has(byName) ? null : byName;
   const dot = name.lastIndexOf(".");
-  if (dot < 1) return null;
-  const extension = name.slice(dot + 1);
-  return BY_EXTENSION.get(extension) ?? EXPLICIT_BY_EXTENSION.get(extension) ?? null;
+  if (dot >= 1) {
+    const extension = name.slice(dot + 1);
+    const curated = BY_EXTENSION.get(extension) ?? EXPLICIT_BY_EXTENSION.get(extension);
+    if (curated) return EXCLUDED_LANGUAGES.has(curated) ? null : curated;
+  }
+  const remote = remoteLanguage(name);
+  if (remote) return EXCLUDED_LANGUAGES.has(remote) ? null : remote;
+  return null;
 }

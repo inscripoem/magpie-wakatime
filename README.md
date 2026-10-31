@@ -44,6 +44,7 @@ key 由 Magpie 存到配置目录下的 `plugin-auth.json`，插件只读取这�
 - `entity` 是发起这次请求的 agent 名（例如 `codex`，取不到时用 `magpie`），`type` 是 `app`，`category` 是 `ai coding`，`is_write` 为 `false`。WakaTime 的应用/实体维度因此会把各个 agent 分开。
 - `time` 用请求发生时间。`project` 优先使用 `projectByAgent`，其次使用请求工作目录对应的 Git 仓库名，非 Git 目录使用目录名，最后回退到 `project`。Git worktree 使用原仓库名；`branch` 是请求发生时的分支名，无法识别或处于 detached HEAD 时省略。
 - `language` 先看本次回复里工具调用（`tool_use` / `tool_calls`）实际编辑或读取的文件扩展名：写/编辑工具优先，读工具只在 Git 推断不出语言时补位；没有再回退到请求工作目录下 Git 跟踪文件的扩展名，取文件数最多的编程语言（例如 `TypeScript`）。同目录的 Git 推断结果在插件宿主进程内缓存；都无法推断时省略该字段，WakaTime 会把它归入 `Other`。
+- 扩展名映射优先使用 WakaTime 的 `program_languages`；插件内置一份快照，启动后每 24 小时刷新，失败 1 小时重试。`Diff` 默认排除，补丁文件不参与语言归因。
 - 对 Codex，还会读取 `~/.codex/sessions/**/rollout-*.jsonl` 中 `item_completed` 的 `FileChange` 事件：`changes` 的键（逗号分隔的绝对路径）和 `stdout` 的 `A/M/D` 行。只解析这一种事件行，跳过 message、reasoning 和提示词；按 `ctx.session` 的 UUID 匹配会话文件。
 - `ai_input_tokens` = `in + cache_write`（未命中缓存的输入加缓存写入），`ai_cached_input_tokens` = `cache_read`（为 0 时省略），`ai_output_tokens` = `out`。WakaTime 按未命中缓存的输入、缓存输入、输出三项分别计价，所以缓存读取单独上报。`reasoning` 是 `out` 的内部拆分，不重复相加。
 - `ai_session` 是本机随机盐加 agent/session 的 HMAC 摘要，同一会话稳定、跨机器不可还原。
@@ -56,7 +57,7 @@ key 由 Magpie 存到配置目录下的 `plugin-auth.json`，插件只读取这�
 
 ## 不会发送什么
 
-账号名、邮箱、密钥、提示词、对话正文、工具结果、完整文件路径、供应商配置名、上游地址、费用和错误正文都不会离开本机。项目名、分支名、语言名、机器名、系统信息、时区和 agent 名会发送给 WakaTime。本地状态库保存归一化统计、摘要、队列和项目/分支/语言快照，不保存工作目录、原始响应 ID 或对话内容。语言识别只在内存中解析工具调用参数里的文件路径和扩展名，跳过文件正文与 shell 命令，不写日志、不入库、不上传。Codex 会话文件只读取 `FileChange` 事件行；不保存、不上传路径或 stdout。
+账号名、邮箱、密钥、提示词、对话正文、工具结果、完整文件路径、供应商配置名、上游地址、费用和错误正文都不会离开本机。项目名、分支名、语言名、机器名、系统信息、时区和 agent 名会发送给 WakaTime。本地状态库保存归一化统计、摘要、队列和项目/分支/语言快照，不保存工作目录、原始响应 ID 或对话内容。语言识别只在内存中解析工具调用参数里的文件路径和扩展名，跳过文件正文与 shell 命令，不写日志、不入库、不上传。Codex 会话文件只读取 `FileChange` 事件行；不保存、不上传路径或 stdout。刷新语言表只向 WakaTime 发送 API key，不发送文件路径或内容。
 
 ## 与现有 WakaTime 采集的重复
 

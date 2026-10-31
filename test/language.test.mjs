@@ -30,8 +30,10 @@ test("maps an explicitly named file, including documents and data", () => {
   for (const [file, language] of [
     ["src/app.ts", "TypeScript"], ["C:\\repo\\main.py", "Python"],
     ["notes/README.md", "Markdown"], ["config/app.yaml", "YAML"],
-    ["data/rows.csv", "CSV"], ["Dockerfile", "Docker"],
+    ["data/rows.csv", "CSV"], ["Dockerfile", "Dockerfile"],
     ["Makefile", "Makefile"], ["CMakeLists.txt", "CMake"],
-    ["unknown.bin", null], [null, null], ["", null],
+    ["events.jsonl", "JSON"], ["config.json.example", "JSON"],
+    ["foo.bsl", "1C Enterprise"], ["change.patch", null],
+    ["run.log", null], ["unknown.bin", null], [null, null], ["", null],
   ]) expect(languageForFile(file)).toBe(language);
 });

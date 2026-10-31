@@ -84,3 +84,16 @@ test("does not parse a partial trailing line until it is complete", () => {
     expect(sessions.language(session)).toBe("TypeScript");
   } finally { rmSync(home, { recursive: true }); }
 });
+
+test("keeps the last language when a change has only unmapped extensions", () => {
+  const home = tempDirectory();
+  try {
+    writeSession(home, [
+      meta,
+      fileChange({ "/repo/notes.md": {} }),
+      fileChange({ "/repo/run.log": {} }),
+      fileChange({ "/repo/change.patch": {} }),
+    ]);
+    expect(new CodexSessions({ home }).language(session)).toBe("Markdown");
+  } finally { rmSync(home, { recursive: true }); }
+});
