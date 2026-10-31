@@ -122,3 +122,81 @@ test("keeps the repository project name in linked worktrees and omits detached b
     rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
   }
 });
+
+test("prefers the file named by a write tool over the repository's Git language", async () => {
+  const directory = tempDirectory(), repo = join(directory, "real-repo");
+  mkdirSync(repo);
+  git(repo, "init", "-q", "--initial-branch=main");
+  writeFileSync(join(repo, "app.ts"), "");
+  git(repo, "add", "app.ts");
+  const options = readOptions(), worker = new Sync(directory, options);
+  try {
+    worker.store.activate(options.gatewayUrl, Date.now());
+    bindWorker(worker);
+    const context = () => ({ origin: "local", agent: "claude", cwd: repo, protocol: "anthropic", state: {} });
+    const write = context();
+    await onRequest({}, write);
+    await onResponse({ id: "write-reply", type: "message", role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "Write", input: { file_path: "notes.md" } }] }, write);
+    const read = context();
+    await onRequest({}, read);
+    await onResponse({ id: "read-reply", type: "message", role: "assistant",
+      content: [{ type: "tool_use", id: "t2", name: "Read", input: { file_path: "notes.md" } }] }, read);
+    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%' ORDER BY rowid").all()
+      .map((r) => JSON.parse(r.value))).toEqual([
+        { project: "real-repo", branch: "main", language: "Markdown" },
+        { project: "real-repo", branch: "main", language: "TypeScript" },
+      ]);
+  } finally {
+    await worker.stop();
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("fills a missing Git language from a read tool in a non-Git directory", async () => {
+  const directory = tempDirectory(), cwd = join(directory, "plain-project");
+  mkdirSync(cwd);
+  const ceiling = process.env.GIT_CEILING_DIRECTORIES;
+  process.env.GIT_CEILING_DIRECTORIES = directory;
+  const options = readOptions(), worker = new Sync(directory, options);
+  try {
+    worker.store.activate(options.gatewayUrl, Date.now());
+    bindWorker(worker);
+    const ctx = { origin: "local", agent: "claude", cwd, protocol: "anthropic", state: {} };
+    await onRequest({}, ctx);
+    await onResponse({ id: "read-reply", type: "message", role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "solution.py" } }] }, ctx);
+    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%'").all()
+      .map((r) => JSON.parse(r.value))).toEqual([{ project: "plain-project", language: "Python" }]);
+  } finally {
+    if (ceiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = ceiling;
+    await worker.stop(); rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("stores only the language, not the file path or the file body", async () => {
+  const directory = tempDirectory(), repo = join(directory, "real-repo");
+  mkdirSync(repo);
+  git(repo, "init", "-q", "--initial-branch=main");
+  writeFileSync(join(repo, "app.ts"), "");
+  git(repo, "add", "app.ts");
+  const options = readOptions(), worker = new Sync(directory, options);
+  try {
+    worker.store.activate(options.gatewayUrl, Date.now());
+    bindWorker(worker);
+    const ctx = { origin: "local", agent: "claude", cwd: repo, protocol: "anthropic", state: {} };
+    await onRequest({}, ctx);
+    await onResponse({ id: "private-reply", type: "message", role: "assistant", content: [
+      { type: "tool_use", id: "t1", name: "Write",
+        input: { file_path: "/repo/private-notes.md", content: "private-file-body" } },
+    ] }, ctx);
+    const metadata = JSON.stringify(worker.store.db.query("SELECT * FROM meta").all());
+    expect(metadata).toContain("Markdown");
+    expect(metadata).not.toContain("private-notes.md");
+    expect(metadata).not.toContain("private-file-body");
+  } finally {
+    await worker.stop();
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
+});

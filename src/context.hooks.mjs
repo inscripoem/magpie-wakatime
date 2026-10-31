@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
 import { contextKey } from "./map.mjs";
 import { detectLanguage } from "./language.mjs";
+import { languageFromReply } from "./reply-language.mjs";
 
 const exec = promisify(execFile);
 let worker;
@@ -64,6 +65,12 @@ export async function onRequest(_body, ctx) {
 
 export async function onResponse(reply, ctx) {
   if (!worker || worker.stopped || !worker.enabled() || ctx.signal?.aborted || !ctx.state.wakatime) return;
+  let picked = null;
+  try { picked = languageFromReply(reply, ctx.protocol ?? ctx.request?.protocol); }
+  catch { /* Language is optional; a parser failure leaves the Git guess. */ }
+  if (picked?.language && (picked.write || !ctx.state.wakatime.language)) {
+    ctx.state.wakatime.language = picked.language;
+  }
   const key = contextKey(ctx.agent, reply?.id || reply?.responseId, worker.store.get("salt"));
   if (!key) return;
   try { worker.store.set(key, ctx.state.wakatime); }

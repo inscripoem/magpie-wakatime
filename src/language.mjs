@@ -69,3 +69,30 @@ export function detectLanguage(files) {
   }
   return best?.language ?? null;
 }
+
+// A file the agent names explicitly (an edit's file_path, a patch's path) is a
+// stronger signal than the repository's dominant language, and documents count
+// here: writing a .md file is Markdown even when README.md never decides a
+// repository's language.
+const EXPLICIT_BY_EXTENSION = new Map(Object.entries({
+  md: "Markdown", mdx: "Markdown",
+  json: "JSON", jsonc: "JSON", json5: "JSON",
+  yaml: "YAML", yml: "YAML", toml: "TOML", ini: "INI",
+  csv: "CSV", tsv: "TSV", txt: "Text", xml: "XML",
+}));
+
+const EXPLICIT_BY_NAME = new Map(Object.entries({
+  dockerfile: "Docker", makefile: "Makefile", "cmakelists.txt": "CMake",
+}));
+
+export function languageForFile(value) {
+  if (typeof value !== "string" || !value) return null;
+  const path = value.split(/[?#]/)[0].replace(/\\/g, "/");
+  const name = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+  const byName = EXPLICIT_BY_NAME.get(name);
+  if (byName) return byName;
+  const dot = name.lastIndexOf(".");
+  if (dot < 1) return null;
+  const extension = name.slice(dot + 1);
+  return BY_EXTENSION.get(extension) ?? EXPLICIT_BY_EXTENSION.get(extension) ?? null;
+}

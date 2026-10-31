@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { detectLanguage } from "../src/language.mjs";
+import { detectLanguage, languageForFile } from "../src/language.mjs";
 
 const files = (...list) => list.map((file) => `${file}\0`).join("");
 
@@ -24,4 +24,14 @@ test("returns nothing when no tracked file carries a recognized language", () =>
 test("breaks ties deterministically", () => {
   expect(detectLanguage(files("a.py", "b.rs"))).toBe("Python");
   expect(detectLanguage(files("b.rs", "a.py"))).toBe("Python");
+});
+
+test("maps an explicitly named file, including documents and data", () => {
+  for (const [file, language] of [
+    ["src/app.ts", "TypeScript"], ["C:\\repo\\main.py", "Python"],
+    ["notes/README.md", "Markdown"], ["config/app.yaml", "YAML"],
+    ["data/rows.csv", "CSV"], ["Dockerfile", "Docker"],
+    ["Makefile", "Makefile"], ["CMakeLists.txt", "CMake"],
+    ["unknown.bin", null], [null, null], ["", null],
+  ]) expect(languageForFile(file)).toBe(language);
 });
