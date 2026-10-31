@@ -85,7 +85,7 @@ test("does not parse a partial trailing line until it is complete", () => {
   } finally { rmSync(home, { recursive: true }); }
 });
 
-test("keeps the last language when a change has only unmapped extensions", () => {
+test("clears the language when the last file change is unmapped", () => {
   const home = tempDirectory();
   try {
     writeSession(home, [
@@ -94,6 +94,23 @@ test("keeps the last language when a change has only unmapped extensions", () =>
       fileChange({ "/repo/run.log": {} }),
       fileChange({ "/repo/change.patch": {} }),
     ]);
-    expect(new CodexSessions({ home }).language(session)).toBe("Markdown");
+    expect(new CodexSessions({ home }).language(session)).toBeNull();
+  } finally { rmSync(home, { recursive: true }); }
+});
+
+test("keeps the last file result across a request with no new change", () => {
+  const home = tempDirectory();
+  try {
+    const file = writeSession(home, [meta, fileChange({ "/repo/notes.md": {} })]);
+    const sessions = new CodexSessions({ home });
+    expect(sessions.language(session)).toBe("Markdown");
+    // No new FileChange: a session pulse keeps the last file result.
+    expect(sessions.language(session)).toBe("Markdown");
+    appendFileSync(file, `${JSON.stringify(fileChange({ "/repo/run.log": {} }))}\n`);
+    // A new unmapped change clears it, and the cleared value stays.
+    expect(sessions.language(session)).toBeNull();
+    expect(sessions.language(session)).toBeNull();
+    appendFileSync(file, `${JSON.stringify(fileChange({ "/repo/app.py": {} }))}\n`);
+    expect(sessions.language(session)).toBe("Python");
   } finally { rmSync(home, { recursive: true }); }
 });

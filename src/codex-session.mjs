@@ -123,8 +123,11 @@ export class CodexSessions {
       if (event?.type !== "event_msg" || event?.payload?.type !== "item_completed") continue;
       const item = event.payload.item;
       if (!item || item.type !== "FileChange") continue;
-      const picked = dominant(pathsOf(item));
-      if (picked) language = picked;
+      // A new file change replaces the last result even when its extension is
+      // unmapped. A request with no new change keeps the last result, which is
+      // the same session-pulse behavior the WakaTime CLI applies to app
+      // heartbeats.
+      language = dominant(pathsOf(item));
     }
     state.language = language;
     state.checked = Date.now();
