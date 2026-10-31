@@ -200,3 +200,43 @@ test("stores only the language, not the file path or the file body", async () =>
     rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
   }
 });
+
+test("reads Codex file changes from the session transcript", async () => {
+  const directory = tempDirectory(), repo = join(directory, "real-repo"), home = join(directory, "codex");
+  mkdirSync(repo);
+  git(repo, "init", "-q", "--initial-branch=main");
+  writeFileSync(join(repo, "app.ts"), "");
+  git(repo, "add", "app.ts");
+  const now = new Date();
+  const dir = join(home, "sessions", String(now.getFullYear()),
+    String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0"));
+  mkdirSync(dir, { recursive: true });
+  const session = "01a19120-9803-7c13-b8e5-90e8df2fb80d";
+  writeFileSync(join(dir, `rollout-test-${session}.jsonl`), [
+    JSON.stringify({ type: "session_meta", payload: { id: session } }),
+    JSON.stringify({ type: "event_msg", payload: { type: "item_completed", thread_id: session,
+      item: { type: "FileChange", changes: { "/repo/private-notes.md": {} },
+        stdout: "Success. Updated the following files:\nM private-notes.md\nprivate-file-body\n" } } }),
+  ].join("\n") + "\n");
+  const ceiling = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = home;
+  const options = readOptions(), worker = new Sync(directory, options);
+  try {
+    worker.store.activate(options.gatewayUrl, Date.now());
+    bindWorker(worker);
+    const ctx = { origin: "local", agent: "codex", cwd: repo, session, protocol: "responses", state: {} };
+    await onRequest({}, ctx);
+    await onResponse({ id: "codex-session-reply" }, ctx);
+    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%'").all()
+      .map((r) => JSON.parse(r.value))).toEqual([
+        { project: "real-repo", branch: "main", language: "Markdown" },
+      ]);
+    const metadata = JSON.stringify(worker.store.db.query("SELECT * FROM meta").all());
+    expect(metadata).not.toContain("private-notes.md");
+    expect(metadata).not.toContain("private-file-body");
+  } finally {
+    if (ceiling === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = ceiling;
+    await worker.stop();
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
