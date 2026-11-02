@@ -105,6 +105,10 @@ test("recognizes GitHub installations and still honors their disabled state", ()
       "https://github.com/Dreaminko/magpie-wakatime#v0.1.6",
       "git+https://github.com/Dreaminko/magpie-wakatime.git#main",
       "https://github.com/dreaminko/MAGPIE-WAKATIME.git",
+      "https://github.com/inscripoem/magpie-wakatime.git",
+      "github:inscripoem/magpie-wakatime",
+      "github:inscripoem/magpie-wakatime#feat/reply-language-tool-calls",
+      "inscripoem/magpie-wakatime#main",
     ]) {
       writeFileSync(file, JSON.stringify({ plugins: [{ spec }] }));
       expect(pluginEnabled(dir, "F:/installed-plugin")).toBe(true);
@@ -122,6 +126,8 @@ test("does not enable the plugin for unrelated GitHub repositories or hosts", ()
     const file = join(dir, "plugins.json");
     for (const spec of [
       "https://github.com/other/magpie-wakatime",
+      "github:other/magpie-wakatime",
+      "other/magpie-wakatime",
       "https://github.com/Dreaminko/magpie-wakatime-other",
       "https://github.com/Dreaminko/magpie-wakatime/tree/main",
       "https://github.com.evil/Dreaminko/magpie-wakatime",
