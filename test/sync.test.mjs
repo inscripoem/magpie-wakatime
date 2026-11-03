@@ -1142,3 +1142,48 @@ test("a one-row head insertion crash re-sends only that row", async () => {
     cleanup(first.directory);
   }
 }, 30_000);
+
+test("recovers a middle insertion behind a committed cursor", async () => {
+  const rows = Array.from({ length: 600 }, (_, index) => row(index + 1));
+  let mutated = false;
+  const sourceFetcher = async (url) => {
+    const offset = Number(new URL(url).searchParams.get("offset"));
+    const source = mutated ? rows : rows.slice();
+    const body = {
+      rows: source.slice(offset, offset + 500),
+      total: source.length,
+      offset: Math.min(offset, source.length),
+    };
+    if (!mutated && offset === 0) {
+      mutated = true;
+      rows.splice(250, 0, row(10_600));
+    }
+    return Response.json(body);
+  };
+  const { directory, worker, fetcher } = setup(rows, { sourceFetcher });
+  try {
+    const salt = worker.state.salt;
+    worker.state.setCursor(day, {
+      offset: 500,
+      head: cursorId(sourceId(rows[0], salt)),
+      tail: cursorId(sourceId(rows[499], salt)),
+      total: rows.length,
+      time: Date.parse(rows[499].t),
+    });
+    worker.state.flush(now, true);
+    worker.state.lastFlush = now;
+    for (let index = 0; index < 8; index++) {
+      await worker.tick(now + index * 31_000);
+      if ((worker.state.cursor(day)?.offset ?? 0) >= rows.length) break;
+    }
+    expect(worker.state.cursor(day)?.offset).toBe(601);
+    const delivered = new Map();
+    for (const payload of fetcher.calls.flat()) {
+      delivered.set(payload.time, (delivered.get(payload.time) ?? 0) + 1);
+    }
+    for (const value of rows) {
+      expect(delivered.get(Date.parse(value.t) / 1000)).toBe(1);
+    }
+    expect(worker.queue.status().pending).toBe(0);
+  } finally { cleanup(directory, worker); }
+}, 30_000);

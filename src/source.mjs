@@ -256,9 +256,11 @@ export async function collectDay(state, options, day, {
   // A tail append changes the total but not the processed prefix, so requiring
   // an exact total would stall a busy gateway. Re-check the old cursor after
   // the read instead: an insertion before the window moves its tail row, while
-  // a tail append leaves it in place. Then verify the candidate's own tail so a
-  // shift inside the window cannot be committed.
-  if (cursor && head === cursor.head &&
+  // a tail append leaves it in place. A reset result has already decided to
+  // re-read from zero, so the moved old tail must not reject the reset itself;
+  // the candidate-tail check below governs that path. Then verify the
+  // candidate's own tail so a shift inside the window cannot be committed.
+  if (!result.reset && cursor && head === cursor.head &&
       !(await verifyTail(state, options, day, cursor, context))) {
     return { ...result, cursor, complete: false, stable: false };
   }
