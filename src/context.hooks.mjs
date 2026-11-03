@@ -30,11 +30,16 @@ function label(value) {
 // Snapshot before routing; delayed usage scans must not read a newer HEAD.
 export async function onRequest(_body, ctx) {
   const current = worker;
-  if (!current || current.stopped || !current.enabled() || current.state.get("enabledAt") === null ||
-      ctx.origin !== "local" || current.options.excludeAgents.includes(ctx.agent) ||
-      typeof ctx.cwd !== "string" || !isAbsolute(ctx.cwd) || ctx.signal?.aborted) return;
+  if (!current) return;
+  if (current.stopped) { current.countHook?.("stopped"); return; }
+  if (!current.enabled()) { current.countHook?.("disabled"); return; }
+  if (current.state.get("enabledAt") === null) { current.countHook?.("notActivated"); return; }
+  if (ctx.origin !== "local") { current.countHook?.("origin"); return; }
+  if (current.options.excludeAgents.includes(ctx.agent)) { current.countHook?.("excludedAgent"); return; }
+  if (typeof ctx.cwd !== "string" || !isAbsolute(ctx.cwd)) { current.countHook?.("noCwd"); return; }
+  if (ctx.signal?.aborted) { current.countHook?.("aborted"); return; }
   try {
-    if (!(await stat(ctx.cwd)).isDirectory()) return;
+    if (!(await stat(ctx.cwd)).isDirectory()) { current.countHook?.("notDirectory"); return; }
     const git = async (...args) => {
       try {
         const { stdout } = await exec("git", ["-C", ctx.cwd, ...args], {
@@ -51,7 +56,8 @@ export async function onRequest(_body, ctx) {
     const [root, common] = location.split(/\r?\n/);
     const projectRoot = common && basename(common) === ".git" ? dirname(resolve(ctx.cwd, common)) : root;
     const project = label(basename(projectRoot || ctx.cwd));
-    if (!project || ctx.signal?.aborted || current !== worker || current.stopped) return;
+    if (!project) { current.countHook?.("projectEmpty"); return; }
+    if (ctx.signal?.aborted || current !== worker || current.stopped) { current.countHook?.("discarded"); return; }
     let language = languages.get(key);
     if (language === undefined) {
       language = detectLanguage(files);
@@ -68,7 +74,8 @@ export async function onRequest(_body, ctx) {
       const fromSession = codexSessions.language(ctx.session);
       if (fromSession) ctx.state.wakatime.language = fromSession;
     }
-  } catch { /* Context is optional; leave the agent request unchanged. */ }
+    current.countHook?.("ok");
+  } catch { current.countHook?.("error"); /* Context is optional; leave the agent request unchanged. */ }
 }
 
 export async function onResponse(reply, ctx) {

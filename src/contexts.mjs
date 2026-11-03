@@ -7,6 +7,7 @@ export class Contexts {
     this.capacity = capacity;
     this.byResponse = new Map();
     this.bySession = new Map();
+    this.counts = { responseHit: 0, sessionHit: 0, miss: 0, pruned: 0, expired: 0, noKey: 0 };
   }
 
   static key(agent, id) {
@@ -41,7 +42,7 @@ export class Contexts {
     if (!key) return null;
     const entry = map.get(key);
     if (!entry) return null;
-    if (now - entry.at > this.ttl) { map.delete(key); return null; }
+    if (now - entry.at > this.ttl) { map.delete(key); this.counts.expired++; return null; }
     return entry.value;
   }
 
@@ -49,18 +50,27 @@ export class Contexts {
   // usage row may be rescanned after the response id is no longer known.
   get(row, now = Date.now()) {
     const agent = row?.agent;
-    return this.lookup(this.byResponse, agent, row?.response_id, now) ??
-      this.lookup(this.bySession, agent, row?.native_session || row?.session, now);
+    const responseKey = Contexts.key(agent, row?.response_id);
+    const sessionKey = Contexts.key(agent, row?.native_session || row?.session);
+    if (!responseKey && !sessionKey) { this.counts.noKey++; return null; }
+    const response = this.lookup(this.byResponse, agent, row?.response_id, now);
+    if (response) { this.counts.responseHit++; return response; }
+    const session = this.lookup(this.bySession, agent, row?.native_session || row?.session, now);
+    if (session) { this.counts.sessionHit++; return session; }
+    this.counts.miss++;
+    return null;
   }
 
   prune(now = Date.now()) {
     for (const map of [this.byResponse, this.bySession]) {
       for (const [key, entry] of map) {
-        if (now - entry.at > this.ttl) map.delete(key);
+        if (now - entry.at > this.ttl) { map.delete(key); this.counts.pruned++; }
         else break; // insertion order is oldest first
       }
     }
   }
+
+  stats() { return { ...this.counts }; }
 
   size() { return this.byResponse.size + this.bySession.size; }
 

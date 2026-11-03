@@ -1,6 +1,6 @@
 {
   "name": "magpie-wakatime",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Send local Magpie AI usage to WakaTime",
   "keywords": ["opencode", "opencode-plugin", "magpie", "wakatime"],
   "license": "MIT",

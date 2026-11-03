@@ -125,7 +125,25 @@ export class Sync {
     this.sourceBlocked = false;
     this.blockedKey = null;
     this.stats = { sent: 0, rejected: 0, lastConfirmedAt: null };
+    this.hookStats = {
+      ok: 0, stopped: 0, disabled: 0, notActivated: 0, origin: 0, excludedAgent: 0,
+      noCwd: 0, aborted: 0, notDirectory: 0, projectEmpty: 0, discarded: 0, error: 0,
+    };
     this.stopped = false;
+  }
+
+  countHook(reason) {
+    if (Object.hasOwn(this.hookStats, reason)) this.hookStats[reason]++;
+  }
+
+  // Diagnose why usage rows lose their project and language: how often the
+  // request hook set a context, and how often the scan failed to find one.
+  // Numbers only; they ride the next cursor flush and appear in `status`.
+  persistContextStats() {
+    this.state.setDiagnostic("contextStats", {
+      hook: { ...this.hookStats },
+      lookup: this.contexts.stats(),
+    });
   }
 
   collectOptions(now) {
@@ -325,7 +343,7 @@ export class Sync {
       }
     }
     if (this.sourceBlocked) return;
-    if (key === this.blockedKey) { this.state.flush(now); return; }
+    if (key === this.blockedKey) { this.persistContextStats(); this.state.flush(now); return; }
 
     this.contexts.prune(now);
     this.seen.prune(now);
@@ -347,6 +365,7 @@ export class Sync {
           /^(source-|invalid-row)/.test(error.message) ? error.message : "scan-stopped");
       }
     }
+    this.persistContextStats();
     this.state.flush(now);
   }
 
@@ -368,6 +387,7 @@ export class Sync {
     clearInterval(this.timer);
     this.abort.abort();
     await this.working;
+    this.persistContextStats();
     this.state.flush(Date.now(), true);
     this.state.release(this.owner);
     this.hasLease = false;
@@ -378,6 +398,7 @@ export class Sync {
       ...this.state.status(now),
       ...this.stats,
       active: this.hasLease,
+      contextStats: { hook: { ...this.hookStats }, lookup: this.contexts.stats() },
       pendingRetry: this.retry.length,
       contexts: this.contexts.size(),
       seen: this.seen.size,
