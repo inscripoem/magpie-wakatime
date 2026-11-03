@@ -35,7 +35,10 @@ test("matches the client response ID in memory and across a restart", async () =
     expect(values(worker)).toEqual([{ project: "real-repo", branch: "main", language: "TypeScript" }]);
 
     const live = await collectDay(worker.state, options, localDay(now), {
-      now, fetcher: async () => Response.json({ rows, total: rows.length, offset: 0 }),
+      now, fetcher: async (url) => {
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        return Response.json({ rows: rows.slice(offset, offset + 500), total: rows.length, offset: Math.min(offset, rows.length) });
+      },
       contexts: worker.contexts, seen: new Seen(),
     });
     expect(live.items[0].payload).toMatchObject({ project: "real-repo", branch: "main", language: "TypeScript" });
@@ -46,7 +49,10 @@ test("matches the client response ID in memory and across a restart", async () =
     // row keeps its project and language instead of degrading to the fallback.
     const restarted = new Sync(directory, options);
     const recovered = await collectDay(restarted.state, options, localDay(now), {
-      now, fetcher: async () => Response.json({ rows, total: rows.length, offset: 0 }),
+      now, fetcher: async (url) => {
+        const offset = Number(new URL(url).searchParams.get("offset"));
+        return Response.json({ rows: rows.slice(offset, offset + 500), total: rows.length, offset: Math.min(offset, rows.length) });
+      },
       contexts: restarted.contexts, seen: new Seen(),
     });
     expect(recovered.items.map((item) => item.payload.project)).toEqual(["real-repo", "Magpie", "Magpie"]);

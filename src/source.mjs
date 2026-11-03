@@ -54,8 +54,10 @@ async function readRange(state, options, day, start, end, {
   while (offset < end && pages < budget) {
     const pageStart = offset;
     const body = await sourcePage(options, day, pageStart, { fetcher, signal });
-    // A different total means rows were inserted or removed between pages.
-    if (body.total !== pass.total) pass.unstable = true;
+    // A lower total means rows were removed between pages. A higher total is
+    // a tail append and does not move the prefix; the post-read tail checks
+    // catch a middle insertion.
+    if (body.total < pass.total) pass.unstable = true;
     if (!body.rows.length) break;
     const stop = Math.min(body.rows.length, end - pageStart);
     let consumed = 0, full = false;
@@ -145,7 +147,7 @@ async function findHead(state, options, day, first, target, { fetcher, signal, b
 // it started from without another parameter.
 async function stableHead(options, day, head, total, salt, { fetcher, signal }) {
   const check = await sourcePage(options, day, 0, { fetcher, signal });
-  return check.total === total && (check.rows.length ? cursorId(sourceId(check.rows[0], salt)) : null) === head;
+  return check.total >= total && (check.rows.length ? cursorId(sourceId(check.rows[0], salt)) : null) === head;
 }
 
 export async function collectDay(state, options, day, {
@@ -251,11 +253,22 @@ export async function collectDay(state, options, day, {
   if (pass.unstable) {
     return { ...result, cursor, complete: false, stable: false };
   }
-  // Pages shift when another request completes while they are read. A changed
-  // head or total means this pass may have skipped or repeated a row; leave the
-  // cursor alone and let the next pass use the seen set. This runs for partial
-  // windows too, so every committed prefix names a stable listing.
+  // A tail append changes the total but not the processed prefix, so requiring
+  // an exact total would stall a busy gateway. Re-check the old cursor after
+  // the read instead: an insertion before the window moves its tail row, while
+  // a tail append leaves it in place. Then verify the candidate's own tail so a
+  // shift inside the window cannot be committed.
+  if (cursor && head === cursor.head &&
+      !(await verifyTail(state, options, day, cursor, context))) {
+    return { ...result, cursor, complete: false, stable: false };
+  }
+  // The head id must be unchanged; the total may grow from tail appends.
   if (!(await stableHead(options, day, head, total, salt, context))) {
+    return { ...result, cursor, complete: false, stable: false };
+  }
+  if (result.cursor && (!cursor || result.cursor.offset !== cursor.offset ||
+      result.cursor.tail !== cursor.tail) &&
+      !(await verifyTail(state, options, day, result.cursor, context))) {
     return { ...result, cursor, complete: false, stable: false };
   }
   return result;

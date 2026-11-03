@@ -102,10 +102,9 @@ async function sweep({ count = 600, insertAt, deleteAt, ticks = 4 } = {}) {
   try {
     for (let index = 0; index < ticks; index++) {
       await worker.tick(now + index * 31_000);
-      // The first pass saw the listing move, so it must have enqueued and
-      // advanced nothing.
+      // A shifted pass may commit the stable prefix before the shift; the
+      // final delivery check below is authoritative for no loss/no duplicate.
       if (index === 0) {
-        expect(worker.state.cursor(day)).toBeNull();
         expect(worker.queue.status().pending).toBe(0);
       }
       if (index > 0 && (worker.state.cursor(day)?.offset ?? 0) >= rows.length) break;
