@@ -1,222 +1,301 @@
 import { expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { hostname, platform, release } from "node:os";
-import { Store } from "../src/store.mjs";
-import { sendBatch, Sync } from "../src/sync.mjs";
+import { Sync } from "../src/sync.mjs";
 import { readOptions } from "../src/config.mjs";
-import { localDay } from "../src/source.mjs";
-import { mapRow } from "../src/map.mjs";
+import { localDay, cursorId } from "../src/source.mjs";
+import { sourceId } from "../src/map.mjs";
 import { tempDirectory } from "./helpers.mjs";
 
-const payload = { entity: "magpie", type: "app", category: "ai coding", time: 1792026000.123,
-  project: "Magpie", ai_input_tokens: 110, ai_cached_input_tokens: 20, ai_output_tokens: 30, is_write: false };
-function enqueue(store, n) { store.ingest(Array.from({ length: n }, (_, i) => ({ id: `row-${i}`, payload }))); }
-
-test("continues to today's usage when backfill contains an invalid row", async () => {
-  const directory = tempDirectory();
-  const now = Date.now(), today = localDay(now), yesterday = localDay(now, -1);
-  const requestedDays = [];
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
-    const day = new URL(request.url).searchParams.get("period").split("..")[0];
-    requestedDays.push(day);
-    const rows = day === yesterday ? [{ t: "bad", in: 10, out: 2 }] :
-      [{ t: new Date(now).toISOString(), agent: "codex", in: 10, out: 2 }];
-    return Response.json({ rows, total: rows.length, offset: 0 });
-  } });
-  const options = readOptions({ gatewayUrl: server.url.origin });
-  const worker = new Sync(directory, options);
-  try {
-    worker.store.activate(options.gatewayUrl, new Date(`${yesterday}T00:00:00`).getTime());
-    await worker.scan(now);
-    expect(requestedDays).toContain(today);
-    expect(worker.store.status()).toMatchObject({ pending: 1, lastCompleteDay: today,
-      lastInvalidRow: { day: yesterday, error: "invalid-row" } });
-  } finally { await worker.stop(); server.stop(true); rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 }); }
+const now = new Date(2026, 10, 3, 12, 0, 0).getTime();
+const day = localDay(now);
+const row = (id, extra = {}) => ({
+  t: new Date(now - 60_000 + id * 1000).toISOString(),
+  route_id: id, agent: "codex", provider: "mock", model: "gpt-5.4",
+  in: 10, out: 2, cache_read: 0, cache_write: 0, ...extra,
 });
 
-test("preserves each model in a mixed bulk request and its retry", async () => {
-  const store = new Store(":memory:");
+function gateway(rows) {
+  return async (url) => {
+    const offset = Number(new URL(url).searchParams.get("offset"));
+    const total = rows.length;
+    return Response.json({ rows: rows.slice(offset, offset + 500), total, offset: Math.min(offset, total) });
+  };
+}
+
+function gatewayByDay(days) {
+  return async (url) => {
+    const parsed = new URL(url);
+    const day = parsed.searchParams.get("period").split("..")[0];
+    const offset = Number(parsed.searchParams.get("offset"));
+    const rows = days[day] ?? [];
+    return Response.json({ rows: rows.slice(offset, offset + 500), total: rows.length, offset: Math.min(offset, rows.length) });
+  };
+}
+
+function waka(handler = null) {
+  const calls = [];
+  const fetcher = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    if (handler) return handler(calls.length, body, init);
+    return Response.json({ responses: body.map(() => [{ data: {} }, 201]) }, { status: 201 });
+  };
+  fetcher.calls = calls;
+  return fetcher;
+}
+
+function setup(rows, { activate = true, fetcher = waka(), sourceFetcher = gateway(rows), env = { WAKATIME_API_KEY: "test-key" } } = {}) {
+  const directory = tempDirectory();
   const options = readOptions();
-  const row = { t: "2026-10-15T01:02:03Z", agent: "codex", in: 10, out: 2 };
-  const items = [
-    { id: "gpt", payload: mapRow({ ...row, model: "gpt-5.4", effort: "high" }, options, "salt") },
-    { id: "claude", payload: mapRow({ ...row, model: "claude-sonnet-4-6", effort: "low" }, options, "salt") },
-  ];
-  const requests = [];
-  const fetcher = async (_url, init) => {
-    requests.push(JSON.parse(init.body));
-    if (requests.length === 1) return new Response(null, { status: 429, headers: { "Retry-After": "60" } });
-    return Response.json({ responses: [[{}, 201], [{}, 201]] }, { status: 201 });
+  const worker = new Sync(directory, options, { env: { WAKATIME_HOME: directory, ...env }, fetcher, sourceFetcher, now });
+  if (activate) {
+    worker.state.activate(options.gatewayUrl, now - 120_000);
+    // The real activation and the first tick happen at the same instant.
+    worker.state.lastFlush = now;
+  }
+  return { directory, options, worker, fetcher, rows };
+}
+
+function cleanup(directory, ...workers) {
+  for (const worker of workers) { worker.stopped = true; }
+  rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+}
+
+test("sends once, commits the cursor and keeps only tiny JSON state", async () => {
+  const rows = [row(3), row(2), row(1)];
+  const { directory, worker, fetcher } = setup(rows);
+  try {
+    await worker.tick(now);
+    expect(fetcher.calls).toHaveLength(1);
+    expect(fetcher.calls[0]).toHaveLength(3);
+    expect(worker.state.cursor(day)).toMatchObject({ offset: 3, total: 3 });
+    expect(worker.state.cursor(day).head).toBe(cursorId(sourceId(rows[0], worker.state.salt)));
+    expect(worker.state.flush(now + 300_000)).toBe(true);
+    const stateDirectory = join(directory, "magpie-wakatime");
+    expect(readdirSync(stateDirectory).sort()).toEqual(["identity.json", "owner.lock", "state.json"]);
+    const raw = readFileSync(join(stateDirectory, "state.json"), "utf8");
+    expect(raw.length).toBeLessThan(2_048);
+    expect(raw).not.toContain("payload");
+    expect(raw).not.toContain("queue");
+    expect(worker.status().sent).toBe(3);
+  } finally { cleanup(directory, worker); }
+});
+
+test("replays from an unflushed cursor and does not replay a flushed one", async () => {
+  const rows = [row(2), row(1)];
+  const first = setup(rows);
+  try {
+    await first.worker.tick(now);
+    expect(first.fetcher.calls.flat()).toHaveLength(2);
+    first.worker.state.release(first.worker.owner);
+    first.worker.stopped = true;
+
+    const replay = new Sync(first.directory, first.options, {
+      env: { WAKATIME_API_KEY: "test-key" }, fetcher: first.fetcher, sourceFetcher: gateway(rows), now: now + 1000,
+    });
+    await replay.tick(now + 1000);
+    expect(first.fetcher.calls.flat()).toHaveLength(4);
+    replay.stopped = true;
+  } finally { cleanup(first.directory, first.worker); }
+
+  const second = setup(rows);
+  try {
+    await second.worker.tick(now);
+    second.worker.state.flush(now + 60_000, true);
+    second.worker.state.release(second.worker.owner);
+    second.worker.stopped = true;
+
+    const resumed = new Sync(second.directory, second.options, {
+      env: { WAKATIME_API_KEY: "test-key" }, fetcher: second.fetcher, sourceFetcher: gateway(rows), now: now + 61_000,
+    });
+    await resumed.tick(now + 61_000);
+    expect(second.fetcher.calls.flat()).toHaveLength(2);
+    expect(resumed.state.cursor(day).offset).toBe(2);
+    resumed.stopped = true;
+  } finally { cleanup(second.directory, second.worker); }
+});
+
+test("keeps the cursor when a batch fails and retries the original payload", async () => {
+  const rows = [row(3), row(2), row(1)];
+  let attempts = 0;
+  const fetcher = waka(() => {
+    attempts++;
+    return attempts === 1 ? new Response(null, { status: 500 }) :
+      Response.json({ responses: [[{}, 201], [{}, 201], [{}, 201]] }, { status: 201 });
+  });
+  const { directory, worker } = setup(rows, { fetcher });
+  try {
+    await worker.tick(now);
+    expect(worker.state.cursor(day)).toBeNull();
+    expect(worker.retry).toHaveLength(1);
+    expect(fetcher.calls).toHaveLength(1);
+    await worker.tick(now + 61_000);
+    expect(fetcher.calls).toHaveLength(2);
+    expect(fetcher.calls[1]).toEqual(fetcher.calls[0]);
+    expect(worker.state.cursor(day)).toMatchObject({ offset: 3, total: 3 });
+    expect(worker.stats.sent).toBe(3);
+    expect(worker.retry).toHaveLength(0);
+  } finally { cleanup(directory, worker); }
+});
+
+test("retries only the failed rows of a partially accepted batch", async () => {
+  const rows = [row(2), row(1)];
+  let attempts = 0;
+  const fetcher = waka((count, body) => {
+    attempts++;
+    if (attempts === 1) return Response.json({ responses: [[{}, 201], [{}, 500]] }, { status: 201 });
+    return Response.json({ responses: body.map(() => [{}, 201]) }, { status: 201 });
+  });
+  const { directory, worker } = setup(rows, { fetcher });
+  try {
+    await worker.tick(now);
+    expect(worker.state.cursor(day)).toBeNull();
+    expect(fetcher.calls[0]).toHaveLength(2);
+    await worker.tick(now + 61_000);
+    expect(fetcher.calls[1]).toHaveLength(1);
+    expect(worker.state.cursor(day).offset).toBe(2);
+    expect(worker.stats.sent).toBe(2);
+    expect(worker.stats.rejected).toBe(0);
+  } finally { cleanup(directory, worker); }
+});
+
+test("uses live contexts and falls back after a restart", async () => {
+  const rows = [row(2, { response_id: "resp-2" }), row(1, { response_id: "resp-1" })];
+  const first = setup(rows);
+  try {
+    first.worker.contexts.setResponse("codex", "resp-1", { project: "repo", branch: "main", language: "TypeScript" }, now);
+    await first.worker.tick(now);
+    const payloads = first.fetcher.calls[0];
+    expect(payloads.find((payload) => payload.entity === "codex" && payload.project === "repo"))
+      .toMatchObject({ project: "repo", branch: "main", language: "TypeScript" });
+    expect(payloads.filter((payload) => payload.project === "Magpie")).toHaveLength(1);
+
+    first.worker.state.flush(now + 60_000, true);
+    first.worker.state.release(first.worker.owner);
+    first.worker.stopped = true;
+    const late = row(99, { t: new Date(now + 5_000).toISOString(), response_id: "resp-1" });
+    rows.unshift(late);
+    const restarted = new Sync(first.directory, first.options, {
+      env: { WAKATIME_API_KEY: "test-key" }, fetcher: first.fetcher,
+      sourceFetcher: gateway(rows), now: now + 61_000,
+    });
+    await restarted.tick(now + 61_000);
+    const replay = first.fetcher.calls.at(-1);
+    expect(replay).toHaveLength(1);
+    expect(replay[0].project).toBe("Magpie");
+    expect(replay[0].branch).toBeUndefined();
+    restarted.stopped = true;
+  } finally { cleanup(first.directory, first.worker); }
+});
+
+test("sends a late row appended after the cursor", async () => {
+  const rows = [row(2), row(1)];
+  const { directory, worker, fetcher } = setup(rows);
+  try {
+    await worker.tick(now);
+    expect(fetcher.calls.flat()).toHaveLength(2);
+    const late = row(0, { t: new Date(now - 90_000).toISOString() });
+    rows.push(late);
+    await worker.tick(now + 30_000);
+    expect(fetcher.calls).toHaveLength(2);
+    expect(fetcher.calls[1]).toHaveLength(1);
+    expect(fetcher.calls[1][0].time).toBe(Date.parse(late.t) / 1000);
+    expect(worker.state.cursor(day).offset).toBe(3);
+  } finally { cleanup(directory, worker); }
+});
+
+test("reviews a completed previous day for a late row", async () => {
+  const dayOne = new Date(2026, 10, 3, 23, 59, 0).getTime();
+  const dayTwo = dayOne + 11 * 60_000;
+  const make = (time, id) => ({
+    t: new Date(time).toISOString(), route_id: id, agent: "codex", provider: "mock",
+    model: "gpt-5.4", in: 10, out: 2, cache_read: 0, cache_write: 0,
+  });
+  const days = {
+    [localDay(dayOne)]: [make(dayOne - 1000, 1)],
+    [localDay(dayTwo)]: [make(dayTwo - 1000, 2)],
   };
-  try {
-    store.ingest(items);
-    await sendBatch(store, "test-key", { now: 1000, fetcher });
-    await sendBatch(store, "test-key", { now: 61_000, fetcher });
-    expect(requests).toHaveLength(2);
-    expect(requests[0][0].user_agent).toStartWith("gpt/5.4-high Magpie/");
-    expect(requests[0][1].user_agent).toStartWith("sonnet/4-6-low Magpie/");
-    expect(requests[1]).toEqual(requests[0]);
-    expect(store.status()).toMatchObject({ sent: 2, pending: 0 });
-  } finally { store.close(); }
-});
-
-test("sends at most 25 and confirms each bulk result independently", async () => {
-  const store = new Store(":memory:");
-  let posted;
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
-    expect(request.headers.get("authorization")).toBe("Basic MTIzNDU=");
-    expect(request.headers.get("user-agent")).toContain("Magpie/");
-    const os = platform() === "win32" ? "windows" : platform();
-    expect(request.headers.get("user-agent")).toContain(`(${os}-${release()}-`);
-    expect(new URLSearchParams(`name=${request.headers.get("x-machine-name")}`).get("name")).toBe(hostname());
-    expect(request.headers.get("timezone")).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
-    expect(new URL(request.url).search).toBe("");
-    posted = await request.json();
-    return Response.json({ responses: posted.map((_, i) => [i === 0 ? { errors: { entity: ["bad"] } } : { data: { id: `${i}` } }, i === 0 ? 400 : 201]) }, { status: 201 });
-  } });
-  const fetcher = (url, init) => {
-    expect(url).toBe("https://api.wakatime.com/api/v1/users/current/heartbeats.bulk");
-    expect(init.redirect).toBe("manual");
-    return fetch(server.url, init);
-  };
-  try {
-    enqueue(store, 26);
-    await sendBatch(store, "12345", { now: 1000, fetcher });
-    expect(posted).toHaveLength(25);
-    expect(posted[0]).toEqual(payload);
-    expect(store.status()).toMatchObject({ pending: 1, sent: 24, rejected: 1 });
-    expect(store.pending(1000)[0].id).toBe("row-25");
-  } finally { store.close(); server.stop(true); }
-});
-
-test("honors Retry-After and retries original payload without erasing the queue", async () => {
-  const store = new Store(":memory:");
-  let requests = 0, retried;
-  const fetcher = async (_url, init) => {
-    requests++;
-    if (requests === 1) return new Response("rate limited", { status: 429, headers: { "Retry-After": "60" } });
-    retried = JSON.parse(init.body);
-    return Response.json({ responses: [[{ data: { id: "ok" } }, 202]] }, { status: 202 });
-  };
-  try {
-    enqueue(store, 1);
-    await sendBatch(store, "test-key", { now: 1000, fetcher });
-    await sendBatch(store, "test-key", { now: 60_999, fetcher });
-    expect(requests).toBe(1);
-    expect(store.status().pending).toBe(1);
-    await sendBatch(store, "test-key", { now: 61_000, fetcher });
-    expect(retried).toEqual([payload]);
-    expect(store.status().sent).toBe(1);
-  } finally { store.close(); }
-});
-
-test("does not confirm malformed or missing results and never stores error bodies", async () => {
-  const store = new Store(":memory:");
-  try {
-    enqueue(store, 2);
-    const fetcher = async () => Response.json({ responses: [[{ data: { id: "one" } }, 201]] }, { status: 201 });
-    await sendBatch(store, "secret", { now: 1000, fetcher });
-    expect(store.status()).toMatchObject({ pending: 1, sent: 1 });
-    await sendBatch(store, "secret", { now: 1_000_000, fetcher: async () => { throw new Error("private error secret"); } });
-    expect(JSON.stringify(store.status())).not.toContain("private");
-    expect(store.status().pending).toBe(1);
-  } finally { store.close(); }
-});
-
-test("pauses on authentication failure and rechecks ownership before sending", async () => {
-  const store = new Store(":memory:");
-  let calls = 0;
-  const fetcher = async () => { calls++; return new Response("private", { status: 401 }); };
-  try {
-    enqueue(store, 1);
-    await sendBatch(store, "secret", { now: 1000, fetcher, guard: () => false });
-    expect(calls).toBe(0);
-    expect((await sendBatch(store, "secret", { now: 2000, fetcher })).auth).toBe(true);
-    expect(store.status()).toMatchObject({ pending: 1, sent: 0, sendError: "wakatime-http-401" });
-  } finally { store.close(); }
-});
-
-test("missing credentials never activate collection; only one host uploads; disabled hosts stop", async () => {
+  const fetcher = waka();
   const directory = tempDirectory();
-  const env = { WAKATIME_HOME: directory };
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-    return Response.json({ rows: [], total: 0, offset: 0 });
-  } });
-  const options = readOptions({ gatewayUrl: server.url.origin });
-  let enabled = true, uploads = 0;
-  const fetcher = async () => {
-    uploads++;
-    return Response.json({ responses: [[{ data: { id: "ok" } }, 201]] }, { status: 201 });
-  };
-  const a = new Sync(directory, options, { env, enabled: () => enabled, fetcher });
-  const b = new Sync(directory, options, { env, enabled: () => enabled, fetcher });
+  const options = readOptions();
+  const worker = new Sync(directory, options, {
+    env: { WAKATIME_HOME: directory, WAKATIME_API_KEY: "test-key" },
+    fetcher, sourceFetcher: gatewayByDay(days), now: dayOne,
+  });
   try {
-    const now = Date.now();
-    await a.tick(now);
-    expect(a.store.get("enabledAt")).toBeNull();
-    expect(a.store.status().credentials).toBe("missing-key");
-    env.WAKATIME_API_KEY = "fake-key";
-    await a.tick(now + 1000);
-    expect(a.store.get("enabledAt")).toBe(now + 1000);
-    enqueue(a.store, 1);
-    await Promise.all([a.tick(now + 2000), b.tick(now + 2000)]);
-    expect(uploads).toBe(1);
-    enabled = false;
-    enqueue(a.store, 2);
-    await a.tick(now + 4000);
-    expect(uploads).toBe(1);
-  } finally { await a.stop(); await b.stop(); server.stop(true); rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 }); }
+    worker.state.activate(options.gatewayUrl, dayOne - 120_000);
+    worker.state.lastFlush = dayOne;
+    await worker.tick(dayOne);
+    expect(fetcher.calls).toHaveLength(1);
+    expect(worker.state.cursor(localDay(dayOne)).offset).toBe(1);
+
+    // The next day's scan has already moved past the previous day.
+    worker.state.set("backfillDay", localDay(dayTwo));
+    days[localDay(dayOne)].push(make(dayOne - 2000, 3));
+    await worker.tick(dayTwo);
+    expect(fetcher.calls.map((call) => call.length)).toEqual([1, 1, 1]);
+    expect(worker.state.cursor(localDay(dayOne)).offset).toBe(2);
+    expect(fetcher.calls[2][0].time).toBe(Date.parse(new Date(dayOne - 2000).toISOString()) / 1000);
+  } finally { cleanup(directory, worker); }
 });
 
-test("uses the bound account and resumes after its rejected key is rotated", async () => {
-  const directory = tempDirectory(), file = join(directory, "plugin-auth.json");
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-    return Response.json({ rows: [], total: 0, offset: 0 });
-  } });
-  const options = readOptions({ gatewayUrl: server.url.origin, authAccount: "wakatime#new" });
-  const accounts = { wakatime: { type: "api", key: "old-key" }, "wakatime#new": { type: "api", key: "expired-key" } };
-  const usedKeys = [];
-  const worker = new Sync(directory, options, { env: { WAKATIME_HOME: directory }, fetcher: async (_url, init) => {
+test("only the lock owner uploads", async () => {
+  const rows = [row(1)];
+  const fetcher = waka();
+  const directory = tempDirectory();
+  const options = readOptions();
+  const env = { WAKATIME_API_KEY: "test-key" };
+  const a = new Sync(directory, options, { env, fetcher, sourceFetcher: gateway(rows), now });
+  const b = new Sync(directory, options, { env, fetcher, sourceFetcher: gateway(rows), now });
+  a.state.activate(options.gatewayUrl, now - 120_000);
+  try {
+    await Promise.all([a.tick(now), b.tick(now)]);
+    expect(fetcher.calls.flat()).toHaveLength(1);
+    expect(a.state.owns(a.owner, now)).toBe(true);
+    expect(b.state.owns(b.owner, now)).toBe(false);
+  } finally { cleanup(directory, a, b); }
+});
+
+test("pauses on authentication failure until the key rotates", async () => {
+  const rows = [row(1)];
+  const fetcher = waka((_count, _body, init) => {
     const key = Buffer.from(init.headers.Authorization.slice(6), "base64").toString();
-    usedKeys.push(key);
     return key === "rotated-key" ? Response.json({ responses: [[{}, 201]] }, { status: 201 }) :
       new Response(null, { status: 401 });
-  } });
+  });
+  const env = { WAKATIME_API_KEY: "expired-key" };
+  const { directory, worker } = setup(rows, { fetcher, env });
   try {
-    writeFileSync(file, JSON.stringify(accounts));
-    enqueue(worker.store, 1);
-    const now = Date.now();
     await worker.tick(now);
-    expect(worker.store.status()).toMatchObject({ credentials: "invalid-key", pending: 1, sent: 0 });
+    expect(worker.status().diagnostics.credentials).toBe("invalid-key");
+    expect(worker.state.cursor(day)).toBeNull();
+    expect(fetcher.calls).toHaveLength(1);
     await worker.tick(now + 1000);
-    expect(usedKeys).toEqual(["expired-key"]);
-    accounts["wakatime#new"].key = "rotated-key";
-    writeFileSync(file, JSON.stringify(accounts));
-    await worker.tick(now + 2000);
-    expect(usedKeys).toEqual(["expired-key", "rotated-key"]);
-    expect(worker.store.status()).toMatchObject({ credentials: "configured", pending: 0, sent: 1 });
-    delete accounts["wakatime#new"];
-    writeFileSync(file, JSON.stringify(accounts));
-    enqueue(worker.store, 2);
-    await worker.tick(now + 4000);
-    expect(usedKeys).toHaveLength(2);
-    expect(worker.store.status()).toMatchObject({ credentials: "key-account-missing", pending: 1 });
-  } finally { await worker.stop(); server.stop(true); rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 }); }
+    expect(fetcher.calls).toHaveLength(1);
+    worker.env.WAKATIME_API_KEY = "rotated-key";
+    await worker.tick(now + 31_000);
+    expect(fetcher.calls).toHaveLength(2);
+    expect(worker.state.cursor(day).offset).toBe(1);
+  } finally { cleanup(directory, worker); }
 });
 
-test("does not use an old key when a new login creates another account", async () => {
-  const directory = tempDirectory();
-  let uploads = 0;
-  const worker = new Sync(directory, readOptions(), { env: { WAKATIME_HOME: directory }, fetcher: async () => { uploads++; } });
+test("missing credentials never activate or send, and source errors keep the cursor", async () => {
+  const rows = [row(1)];
+  const fetcher = waka();
+  const missing = setup(rows, { activate: false, fetcher, env: {} });
   try {
-    writeFileSync(join(directory, "plugin-auth.json"), JSON.stringify({
-      wakatime: { type: "api", key: "old-key" }, "wakatime#new": { type: "api", key: "new-key" },
-    }));
-    enqueue(worker.store, 1);
-    await worker.tick();
-    expect(uploads).toBe(0);
-    expect(worker.store.status()).toMatchObject({ credentials: "key-account-ambiguous", pending: 1 });
-    expect(worker.store.get("enabledAt")).toBeNull();
-  } finally { await worker.stop(); rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 }); }
+    await missing.worker.tick(now);
+    expect(missing.worker.state.get("enabledAt")).toBeNull();
+    expect(missing.worker.status().diagnostics.credentials).toBe("missing-key");
+    expect(fetcher.calls).toHaveLength(0);
+  } finally { cleanup(missing.directory, missing.worker); }
+
+  const broken = setup(rows, { fetcher, sourceFetcher: async () => { throw new Error("offline"); } });
+  try {
+    await broken.worker.tick(now);
+    expect(broken.worker.status().diagnostics.sourceError).toBe("source-network");
+    expect(broken.worker.state.cursor(day)).toBeNull();
+    expect(fetcher.calls).toHaveLength(0);
+  } finally { cleanup(broken.directory, broken.worker); }
 });

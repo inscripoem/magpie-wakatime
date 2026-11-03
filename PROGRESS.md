@@ -40,3 +40,13 @@ Source plan: PLAN.md. This file records the current state; the status paragraph 
 - WakaTime accepting `ai_cached_input_tokens` in the POST body: the split follows the wakatime-cli payload and the published cost formula, but no heartbeat carrying the field has been sent to WakaTime from here.
 - WakaTime displaying the inferred `language` for `app` heartbeats: the field follows the documented heartbeat schema, but no heartbeat carrying it has been sent to WakaTime from here.
 - The icon as the app draws it: no running Magpie window has been looked at, and this package's published 0.1.1 has no `magpie` field for the npm 发现 card to read.
+
+## Unreleased: high-water cursor refactor (2026-11-03, worktree `experiment/write-jsonl`)
+
+- The SQLite queue (`state.sqlite`, `src/store.mjs`) is replaced by per-day high-water cursors. `state.json` holds each day's `offset/head/tail/total/time` plus copies of `salt/gateway/enabledAt`; `identity.json` holds salt, gateway and first activation; `owner.lock/` is an exclusive lock directory whose `owner.json` carries owner, pid, host and acquisition time.
+- Cursor and identity writes are temp file + rename with no fsync on the cursor; identity is fsynced once per activation. Cursor flushes repeat salt/gateway/enabledAt so either state file can restore them. Flush cadence stays 5 minutes; a crash replays at most the unflushed tail (at-least-once).
+- The lock replaces the 5-minute lease renewal: `mkdir` acquisition, same-host pid liveness for staleness, 10-minute TTL across hosts, no steady-state lock writes.
+- `bun test`: 76 pass, 0 fail (was 70; the lease test became eight lock tests plus one identity-recovery test).
+- Write volume (18,000 requests per simulated day, `bench/highwater.mjs`, `/proc/self/io` plus strace, btrfs): in-place baseline 176 KiB/day of forced physical writes; atomic rename without fsync 1.34 MiB/day; the per-flush fsync variant measured 33.8 MiB/day and was rejected. Micro-benchmark on this filesystem: one fsync pair costs about 132 KiB, one rename about 4 KiB.
+- Legacy `state.sqlite` migration was dropped deliberately: no confirmed installed base on the SQLite-era versions, so an upgrade starts a fresh cursor and re-reads from the gateway.
+- Not yet done: merged into the main checkout; the live runtime still runs the previous code; WakaTime read-side verification (summaries/stats/heartbeats with an OAuth bearer token) still pending.

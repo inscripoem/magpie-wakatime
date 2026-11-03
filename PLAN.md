@@ -108,7 +108,7 @@ Magpie 会为不同 CLI 调用和应用创建不同宿主，更新时旧宿主�
 
 密钥解析优先使用 `apiKeyEnv` 指定的环境变量；未设置时，只读取 WakaTime 标准配置文件 `[settings].api_key`。按 `WAKATIME_HOME` 或用户目录定位配置，不读取和打印整份配置，不修改原有 WakaTime 配置。缺少密钥时显示明确状态，暂不开始采集；配置完成后才确定首次启用时间。
 
-插件状态保存在传入 directory 下的 `magpie-wakatime/state.sqlite`；只保存归一化统计、不可逆身份摘要、队列和扫描状态，不保存 API key、原始会话名、账号名或对话正文。
+插件状态保存在传入 directory 下的 `magpie-wakatime/`：`state.json` 保存逐日扫描游标并冗余 `salt/gateway/enabledAt`，`identity.json` 保存 salt、网关与首次启用时间，`owner.lock/` 保存单实例上传锁。只保存归一化统计、不可逆身份摘要和扫描状态，不保存 API key、原始会话名、账号名或对话正文。
 
 - 每批最多 25 条，最多每秒一批。单请求超时 10 秒；网络错误、429、5xx 采用带抖动的指数退避，范围 5 秒至 5 分钟，并尊重有效的 Retry-After。
 - 批量响应逐项处理；只有对应条目成功才标记已发送。HTTP 请求成功不等于整批成功。

@@ -1,84 +1,137 @@
 import { expect, test } from "bun:test";
-import { collectDay } from "../src/source.mjs";
-import { Store } from "../src/store.mjs";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
+import { collectDay, cursorId } from "../src/source.mjs";
+import { Contexts } from "../src/contexts.mjs";
+import { State } from "../src/state.mjs";
+import { Seen } from "../src/sync.mjs";
 import { readOptions } from "../src/config.mjs";
 import { sourceId } from "../src/map.mjs";
+import { tempDirectory } from "./helpers.mjs";
 
 const day = "2026-10-15";
-const row = (id) => ({ t: `${day}T10:00:00+08:00`, route_id: id, agent: "codex",
-  provider: "mock", model: "mock", in: 10, out: 5, cache_read: 0, cache_write: 0 });
-
-test("isolates invalid rows, advances the cursor and collects corrected rows on rescan", async () => {
-  let rows = [null, row(1), { ...row(2), in: -1, prompt: "private prompt", key: "private key" }, row(3)];
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
-    const offset = Number(new URL(request.url).searchParams.get("offset"));
-    return Response.json({ rows: rows.slice(offset, offset + 3), total: rows.length, offset });
-  } });
-  const store = new Store(":memory:");
-  const options = readOptions({ gatewayUrl: server.url.origin });
-  try {
-    store.activate(options.gatewayUrl, Date.parse(`${day}T00:00:00+08:00`));
-    expect(await collectDay(store, options, day, { budget: 1 })).toBe(false);
-    expect(store.get(`scan:${day}`).offset).toBe(3);
-    expect(store.status()).toMatchObject({ pending: 1, lastInvalidRow: {
-      day, offset: 2, id: sourceId(row(2), store.get("salt")), error: "invalid-row",
-    } });
-    expect(JSON.stringify(store.status())).not.toContain("private");
-    expect(await collectDay(store, options, day)).toBe(true);
-    expect(store.status()).toMatchObject({ pending: 2, lastCompleteDay: day });
-    rows = [row(0), row(1), row(2), row(3)];
-    expect(await collectDay(store, options, day)).toBe(true);
-    expect(store.status().pending).toBe(4);
-  } finally { store.close(); server.stop(true); }
+const at = (hour = 10, minute = 0, second = 0) =>
+  new Date(Date.parse(`${day}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}+08:00`)).toISOString();
+const row = (id, extra = {}) => ({
+  t: at(10, 0, id % 60), route_id: id, agent: "codex", provider: "mock", model: "mock",
+  in: 10, out: 5, cache_read: 0, cache_write: 0, ...extra,
 });
 
-test("resumes paginated scans and rechecks a moving head without duplicating requests", async () => {
-  let rows = Array.from({ length: 501 }, (_, i) => row(i));
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
-    const url = new URL(request.url);
-    expect(url.pathname).toBe("/v1/magpie/usage/requests");
-    expect(url.searchParams.get("period")).toBe("2026-10-15..2026-10-15");
-    expect(url.searchParams.get("via")).toBe("through");
-    expect(url.searchParams.get("computer")).toBe("this");
-    const offset = Number(url.searchParams.get("offset"));
-    return Response.json({ rows: rows.slice(offset, offset + 500), total: rows.length, offset });
-  } });
-  const store = new Store(":memory:");
-  const options = readOptions({ gatewayUrl: server.url.origin });
+function gateway(rows) {
+  return async (url) => {
+    const offset = Number(new URL(url).searchParams.get("offset"));
+    const total = rows.length;
+    return Response.json({ rows: rows.slice(offset, offset + 500), total, offset: Math.min(offset, total) });
+  };
+}
+
+function setup(enabledAt = Date.parse(`${day}T00:00:00+08:00`)) {
+  const directory = tempDirectory();
+  const state = new State(join(directory, "state.json"), { now: Date.parse(`${day}T00:00:00+08:00`) });
+  state.activate("http://127.0.0.1:3425", enabledAt);
+  return { directory, state, options: readOptions({ gatewayUrl: "http://127.0.0.1:3425" }) };
+}
+
+test("offers only mapped rows and leaves cursor commitment to the sender", async () => {
+  const { directory, state, options } = setup(Date.parse(`${day}T09:30:00+08:00`));
+  const rows = [
+    row(0),
+    { t: "bad", route_id: 1, in: 10, out: 2, prompt: "private prompt", key: "private key" },
+    row(2, { in: 0, out: 0 }),
+    row(3, { t: at(9, 0, 0) }),
+    row(4),
+  ];
+  const contexts = new Contexts(), seen = new Seen();
   try {
-    store.activate(options.gatewayUrl, Date.parse(`${day}T00:00:00+08:00`));
-    expect(await collectDay(store, options, day, { budget: 1 })).toBe(false);
-    expect(store.status().pending).toBe(500);
-    rows.unshift(row(999));
-    expect(await collectDay(store, options, day)).toBe(false);
-    expect(await collectDay(store, options, day)).toBe(true);
-    expect(store.status().pending).toBe(502);
-  } finally { store.close(); server.stop(true); }
+    const result = await collectDay(state, options, day, {
+      now: Date.parse(`${day}T12:00:00+08:00`), fetcher: gateway(rows), contexts, seen,
+    });
+    expect(result.complete).toBe(true);
+    expect(result.items.map((item) => item.id)).toEqual([
+      sourceId(rows[0], state.salt), sourceId(rows[4], state.salt),
+    ]);
+    expect(result.cursor).toMatchObject({
+      offset: 5, head: cursorId(sourceId(rows[0], state.salt)), tail: cursorId(sourceId(rows[4], state.salt)), total: 5,
+    });
+    expect(result.cursor.time).toBe(Date.parse(rows[4].t));
+    expect(state.cursor(day)).toBeNull();
+    expect(state.get("lastInvalidRow")).toMatchObject({ day, offset: 1, error: "invalid-row" });
+    expect(JSON.stringify(state.status())).not.toContain("private");
+    expect(seen.has(sourceId(rows[3], state.salt))).toBe(true);
+  } finally {
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
 });
 
-test("never queues pre-activation usage or advances on an incompatible response", async () => {
-  let broken = false;
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-    return Response.json(broken ? { data: [] } : { rows: [row(1)], total: 1, offset: 0 });
-  } });
-  const store = new Store(":memory:");
-  const options = readOptions({ gatewayUrl: server.url.origin });
+test("a partial page scan resumes from its committed offset", async () => {
+  const { directory, state, options } = setup();
+  const rows = Array.from({ length: 501 }, (_, index) => row(index));
+  const contexts = new Contexts(), seen = new Seen();
   try {
-    store.activate(options.gatewayUrl, Date.parse(`${day}T11:00:00+08:00`));
-    expect(await collectDay(store, options, day)).toBe(true);
-    expect(store.status().pending).toBe(0);
-    broken = true;
-    await expect(collectDay(store, options, day)).rejects.toThrow("source-schema");
-  } finally { store.close(); server.stop(true); }
+    const first = await collectDay(state, options, day, {
+      now: Date.parse(`${day}T12:00:00+08:00`), fetcher: gateway(rows), contexts, seen, budget: 1,
+    });
+    expect(first.complete).toBe(false);
+    expect(first.cursor.offset).toBe(500);
+    for (const item of first.items) seen.add(item.id, 1);
+    state.setCursor(day, first.cursor);
+    const second = await collectDay(state, options, day, {
+      now: Date.parse(`${day}T12:01:00+08:00`), fetcher: gateway(rows), contexts, seen, budget: 1,
+    });
+    expect(second.complete).toBe(true);
+    expect(second.items).toHaveLength(1);
+    expect(second.cursor.offset).toBe(501);
+  } finally {
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
 });
 
-test("does not follow a source redirect", async () => {
-  let targetHits = 0;
-  const target = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { targetHits++; return Response.json({}); } });
-  const source = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { return Response.redirect(target.url); } });
-  const store = new Store(":memory:");
+test("picks up front insertions, tail appends and middle late rows without resending", async () => {
+  const { directory, state, options } = setup();
+  const rows = [row(10), row(9), row(8)];
+  const contexts = new Contexts(), seen = new Seen();
+  const now = Date.parse(`${day}T12:00:00+08:00`);
   try {
-    await expect(collectDay(store, readOptions({ gatewayUrl: source.url.origin }), day)).rejects.toThrow("source-http-302");
-    expect(targetHits).toBe(0);
-  } finally { store.close(); source.stop(true); target.stop(true); }
+    const first = await collectDay(state, options, day, { now, fetcher: gateway(rows), contexts, seen });
+    for (const item of first.items) seen.add(item.id, now);
+    state.setCursor(day, first.cursor);
+
+    rows.unshift(row(11)); // new front row
+    let next = await collectDay(state, options, day, { now, fetcher: gateway(rows), contexts, seen });
+    expect(next.items.map((item) => item.id)).toEqual([sourceId(rows[0], state.salt)]);
+    for (const item of next.items) seen.add(item.id, now);
+    state.setCursor(day, next.cursor);
+
+    rows.push(row(7)); // late row appended at the tail
+    next = await collectDay(state, options, day, { now, fetcher: gateway(rows), contexts, seen });
+    expect(next.items.map((item) => item.id)).toEqual([sourceId(rows.at(-1), state.salt)]);
+    for (const item of next.items) seen.add(item.id, now);
+    state.setCursor(day, next.cursor);
+
+    rows.splice(3, 0, row(99, { t: at(10, 0, 8) })); // older late row inserted inside the processed prefix
+    next = await collectDay(state, options, day, { now, fetcher: gateway(rows), contexts, seen });
+    expect(next.items.map((item) => item.id)).toEqual([sourceId(rows[3], state.salt)]);
+    expect(next.items).toHaveLength(1);
+  } finally {
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("reports incompatible sources without advancing", async () => {
+  const { directory, state, options } = setup(Date.parse(`${day}T09:00:00+08:00`));
+  try {
+    await expect(collectDay(state, options, day, { fetcher: async () => Response.json({ data: [] }) }))
+      .rejects.toThrow("source-schema");
+    await expect(collectDay(state, options, day, { fetcher: async () => new Response(null, { status: 500 }) }))
+      .rejects.toThrow("source-http-500");
+    await expect(collectDay(state, options, day, { fetcher: async () => { throw new Error("offline"); } }))
+      .rejects.toThrow("source-network");
+    const result = await collectDay(state, options, day, {
+      fetcher: gateway([row(1, { t: at(8, 0, 0) })]),
+    });
+    expect(result.items).toHaveLength(0);
+    expect(state.cursor(day)).toBeNull();
+  } finally {
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
 });

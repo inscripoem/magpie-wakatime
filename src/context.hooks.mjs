@@ -2,7 +2,6 @@ import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
-import { contextKey } from "./map.mjs";
 import { detectLanguage } from "./language.mjs";
 import { languageFromReply } from "./reply-language.mjs";
 import { CodexSessions } from "./codex-session.mjs";
@@ -31,7 +30,7 @@ function label(value) {
 // Snapshot before routing; delayed usage scans must not read a newer HEAD.
 export async function onRequest(_body, ctx) {
   const current = worker;
-  if (!current || current.stopped || !current.enabled() || current.store.get("enabledAt") === null ||
+  if (!current || current.stopped || !current.enabled() || current.state.get("enabledAt") === null ||
       ctx.origin !== "local" || current.options.excludeAgents.includes(ctx.agent) ||
       typeof ctx.cwd !== "string" || !isAbsolute(ctx.cwd) || ctx.signal?.aborted) return;
   try {
@@ -80,8 +79,9 @@ export async function onResponse(reply, ctx) {
   if (picked?.language && (picked.write || !ctx.state.wakatime.language)) {
     ctx.state.wakatime.language = picked.language;
   }
-  const key = contextKey(ctx.agent, reply?.id || reply?.responseId, worker.store.get("salt"));
-  if (!key) return;
-  try { worker.store.set(key, ctx.state.wakatime); }
-  catch { /* Usage polling continues when a best-effort notification is lost. */ }
+  const response = reply?.id || reply?.responseId;
+  try {
+    worker.contexts.setResponse(ctx.agent, response, ctx.state.wakatime);
+    if (typeof ctx.session === "string") worker.contexts.setSession(ctx.agent, ctx.session, ctx.state.wakatime);
+  } catch { /* Usage polling continues when a best-effort notification is lost. */ }
 }

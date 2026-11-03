@@ -1,17 +1,17 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { bindWorker, onRequest, onResponse } from "../src/context.hooks.mjs";
-import { Sync } from "../src/sync.mjs";
-import { Store } from "../src/store.mjs";
+import { Sync, Seen } from "../src/sync.mjs";
 import { readOptions } from "../src/config.mjs";
 import { collectDay, localDay } from "../src/source.mjs";
 import { tempDirectory } from "./helpers.mjs";
 
 const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true });
+const values = (worker) => worker.contexts.values();
 
-test("keeps request-time Git metadata across restart and matches the client response ID", async () => {
+test("matches the client response ID in memory and loses the context on restart", async () => {
   const directory = tempDirectory(), repo = join(directory, "real-repo"), nested = join(repo, "src");
   mkdirSync(nested, { recursive: true });
   git(repo, "init", "-q", "--initial-branch=main");
@@ -24,32 +24,38 @@ test("keeps request-time Git metadata across restart and matches the client resp
     { t: new Date(now).toISOString(), agent: "claude", in: 10, out: 2, response_id: "resp-original" },
     { t: new Date(now).toISOString(), agent: "codex", in: 10, out: 2, response_id: "unmatched" },
   ];
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-    return Response.json({ rows, total: rows.length, offset: 0 });
-  } });
-  const options = readOptions({ gatewayUrl: server.url.origin });
-  const worker = new Sync(directory, options);
-  let store;
+  const options = readOptions(), worker = new Sync(directory, options);
   try {
-    worker.store.activate(options.gatewayUrl, now - 1);
+    worker.state.activate(options.gatewayUrl, now - 1);
     bindWorker(worker);
     const ctx = { origin: "local", agent: "codex", cwd: nested, state: {}, signal: new AbortController().signal };
     expect(await onRequest({ messages: ["private-prompt"] }, ctx)).toBeUndefined();
-    git(repo, "symbolic-ref", "HEAD", "refs/heads/next");
+    git(repo, "symbolic-ref", "HEAD", "refs/next");
     await onResponse({ id: "resp-original", choices: ["private-answer"] }, ctx);
-    await worker.stop();
-    store = new Store(join(directory, "magpie-wakatime", "state.sqlite"));
-    await collectDay(store, options, localDay(now));
-    const payloads = store.pending(now).map((r) => JSON.parse(r.payload));
-    expect(payloads[0]).toMatchObject({ project: "real-repo", branch: "main", language: "TypeScript" });
-    expect(payloads.slice(1).map((p) => p.project)).toEqual(["Magpie", "Magpie"]);
-    expect(payloads[1].branch).toBeUndefined();
-    const metadata = JSON.stringify(store.db.query("SELECT * FROM meta").all());
+    expect(values(worker)).toEqual([{ project: "real-repo", branch: "main", language: "TypeScript" }]);
+
+    const live = await collectDay(worker.state, options, localDay(now), {
+      now, fetcher: async () => Response.json({ rows, total: rows.length, offset: 0 }),
+      contexts: worker.contexts, seen: new Seen(),
+    });
+    expect(live.items[0].payload).toMatchObject({ project: "real-repo", branch: "main", language: "TypeScript" });
+    expect(live.items.slice(1).map((item) => item.payload.project)).toEqual(["Magpie", "Magpie"]);
+    expect(live.items[1].payload.branch).toBeUndefined();
+
+    const restarted = new Sync(directory, options);
+    const lost = await collectDay(restarted.state, options, localDay(now), {
+      now, fetcher: async () => Response.json({ rows, total: rows.length, offset: 0 }),
+      contexts: restarted.contexts, seen: new Seen(),
+    });
+    expect(lost.items.map((item) => item.payload.project)).toEqual(["Magpie", "Magpie", "Magpie"]);
+    restarted.stopped = true;
+
+    const raw = readFileSync(join(directory, "magpie-wakatime", "state.json"), "utf8");
     for (const secret of [directory, "private-prompt", "private-answer", "resp-original", "private-session"]) {
-      expect(metadata).not.toContain(secret);
+      expect(raw).not.toContain(secret);
     }
   } finally {
-    store?.close(); await worker.stop(); server.stop(true);
+    await worker.stop();
     rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
   }
 });
@@ -63,14 +69,13 @@ test("uses a non-Git directory name and skips missing, remote, excluded or disab
   const options = readOptions({ excludeAgents: ["ignored"] });
   const worker = new Sync(directory, options, { enabled: () => enabled });
   try {
-    worker.store.activate(options.gatewayUrl, Date.now());
+    worker.state.activate(options.gatewayUrl, Date.now());
     bindWorker(worker);
     const context = (extra = {}) => ({ origin: "local", agent: "codex", cwd, state: {}, ...extra });
     const ctx = context();
     await onRequest({}, ctx);
     await onResponse({ responseId: "gemini-response" }, ctx);
-    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%'").all().map((r) => JSON.parse(r.value)))
-      .toEqual([{ project: "plain-project" }]);
+    expect(values(worker)).toEqual([{ project: "plain-project" }]);
     for (const extra of [{ cwd: "" }, { cwd: "relative" }, { cwd: join(directory, "missing") },
       { origin: "remote" }, { origin: "gateway-key" }, { agent: "ignored" },
       { signal: AbortSignal.abort() }]) {
@@ -78,11 +83,12 @@ test("uses a non-Git directory name and skips missing, remote, excluded or disab
       await onRequest({}, skipped);
       await onResponse({ id: "should-not-save" }, skipped);
     }
+    expect(values(worker)).toHaveLength(1);
     enabled = false;
     const skipped = context();
     await onRequest({}, skipped);
     await onResponse({ id: "disabled" }, skipped);
-    expect(worker.store.db.query("SELECT count(*) AS n FROM meta WHERE key LIKE 'context:%'").get().n).toBe(1);
+    expect(values(worker)).toHaveLength(1);
   } finally {
     if (ceiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
     else process.env.GIT_CEILING_DIRECTORIES = ceiling;
@@ -99,7 +105,7 @@ test("keeps the repository project name in linked worktrees and omits detached b
   git(repo, "worktree", "add", "-q", "-b", "feature/worktree", worktree);
   const options = readOptions(), worker = new Sync(directory, options);
   try {
-    worker.store.activate(options.gatewayUrl, Date.now());
+    worker.state.activate(options.gatewayUrl, Date.now());
     bindWorker(worker);
     const ctx = { origin: "local", agent: "codex", cwd: worktree, state: {} };
     await onRequest({}, ctx);
@@ -108,10 +114,9 @@ test("keeps the repository project name in linked worktrees and omits detached b
     const detached = { ...ctx, state: {} };
     await onRequest({}, detached);
     await onResponse({ id: "detached-response" }, detached);
-    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%' ORDER BY rowid").all()
-      .map((r) => JSON.parse(r.value))).toEqual([
-        { project: "real-repo", branch: "feature/worktree" }, { project: "real-repo" },
-      ]);
+    expect(values(worker)).toEqual([
+      { project: "real-repo", branch: "feature/worktree" }, { project: "real-repo" },
+    ]);
   } finally {
     await worker.stop();
     const objects = join(repo, ".git", "objects");
@@ -131,7 +136,7 @@ test("prefers the file named by a write tool over the repository's Git language"
   git(repo, "add", "app.ts");
   const options = readOptions(), worker = new Sync(directory, options);
   try {
-    worker.store.activate(options.gatewayUrl, Date.now());
+    worker.state.activate(options.gatewayUrl, Date.now());
     bindWorker(worker);
     const context = () => ({ origin: "local", agent: "claude", cwd: repo, protocol: "anthropic", state: {} });
     const write = context();
@@ -142,11 +147,10 @@ test("prefers the file named by a write tool over the repository's Git language"
     await onRequest({}, read);
     await onResponse({ id: "read-reply", type: "message", role: "assistant",
       content: [{ type: "tool_use", id: "t2", name: "Read", input: { file_path: "notes.md" } }] }, read);
-    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%' ORDER BY rowid").all()
-      .map((r) => JSON.parse(r.value))).toEqual([
-        { project: "real-repo", branch: "main", language: "Markdown" },
-        { project: "real-repo", branch: "main", language: "TypeScript" },
-      ]);
+    expect(values(worker)).toEqual([
+      { project: "real-repo", branch: "main", language: "Markdown" },
+      { project: "real-repo", branch: "main", language: "TypeScript" },
+    ]);
   } finally {
     await worker.stop();
     rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
@@ -160,14 +164,13 @@ test("fills a missing Git language from a read tool in a non-Git directory", asy
   process.env.GIT_CEILING_DIRECTORIES = directory;
   const options = readOptions(), worker = new Sync(directory, options);
   try {
-    worker.store.activate(options.gatewayUrl, Date.now());
+    worker.state.activate(options.gatewayUrl, Date.now());
     bindWorker(worker);
     const ctx = { origin: "local", agent: "claude", cwd, protocol: "anthropic", state: {} };
     await onRequest({}, ctx);
     await onResponse({ id: "read-reply", type: "message", role: "assistant",
       content: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "solution.py" } }] }, ctx);
-    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%'").all()
-      .map((r) => JSON.parse(r.value))).toEqual([{ project: "plain-project", language: "Python" }]);
+    expect(values(worker)).toEqual([{ project: "plain-project", language: "Python" }]);
   } finally {
     if (ceiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
     else process.env.GIT_CEILING_DIRECTORIES = ceiling;
@@ -175,7 +178,7 @@ test("fills a missing Git language from a read tool in a non-Git directory", asy
   }
 });
 
-test("stores only the language, not the file path or the file body", async () => {
+test("keeps only the language in memory, not the file path or the file body", async () => {
   const directory = tempDirectory(), repo = join(directory, "real-repo");
   mkdirSync(repo);
   git(repo, "init", "-q", "--initial-branch=main");
@@ -183,7 +186,7 @@ test("stores only the language, not the file path or the file body", async () =>
   git(repo, "add", "app.ts");
   const options = readOptions(), worker = new Sync(directory, options);
   try {
-    worker.store.activate(options.gatewayUrl, Date.now());
+    worker.state.activate(options.gatewayUrl, Date.now());
     bindWorker(worker);
     const ctx = { origin: "local", agent: "claude", cwd: repo, protocol: "anthropic", state: {} };
     await onRequest({}, ctx);
@@ -191,10 +194,24 @@ test("stores only the language, not the file path or the file body", async () =>
       { type: "tool_use", id: "t1", name: "Write",
         input: { file_path: "/repo/private-notes.md", content: "private-file-body" } },
     ] }, ctx);
-    const metadata = JSON.stringify(worker.store.db.query("SELECT * FROM meta").all());
-    expect(metadata).toContain("Markdown");
-    expect(metadata).not.toContain("private-notes.md");
-    expect(metadata).not.toContain("private-file-body");
+    const stored = JSON.stringify(values(worker));
+    expect(stored).toContain("Markdown");
+    expect(stored).not.toContain("private-notes.md");
+    expect(stored).not.toContain("private-file-body");
+  } finally {
+    await worker.stop();
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("expires a context after two minutes", async () => {
+  const directory = tempDirectory();
+  const worker = new Sync(directory, readOptions());
+  try {
+    worker.contexts.setResponse("codex", "resp", { project: "repo" }, 1000);
+    expect(worker.contexts.get({ agent: "codex", response_id: "resp" }, 60_000)).toEqual({ project: "repo" });
+    expect(worker.contexts.get({ agent: "codex", response_id: "resp" }, 121_001)).toBeNull();
+    expect(worker.contexts.size()).toBe(0);
   } finally {
     await worker.stop();
     rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
@@ -222,18 +239,17 @@ test("reads Codex file changes from the session transcript", async () => {
   process.env.CODEX_HOME = home;
   const options = readOptions(), worker = new Sync(directory, options);
   try {
-    worker.store.activate(options.gatewayUrl, Date.now());
+    worker.state.activate(options.gatewayUrl, Date.now());
     bindWorker(worker);
     const ctx = { origin: "local", agent: "codex", cwd: repo, session, protocol: "responses", state: {} };
     await onRequest({}, ctx);
     await onResponse({ id: "codex-session-reply" }, ctx);
-    expect(worker.store.db.query("SELECT value FROM meta WHERE key LIKE 'context:%'").all()
-      .map((r) => JSON.parse(r.value))).toEqual([
-        { project: "real-repo", branch: "main", language: "Markdown" },
-      ]);
-    const metadata = JSON.stringify(worker.store.db.query("SELECT * FROM meta").all());
-    expect(metadata).not.toContain("private-notes.md");
-    expect(metadata).not.toContain("private-file-body");
+    expect(values(worker)).toEqual([
+      { project: "real-repo", branch: "main", language: "Markdown" },
+    ]);
+    const stored = JSON.stringify(values(worker));
+    expect(stored).not.toContain("private-notes.md");
+    expect(stored).not.toContain("private-file-body");
   } finally {
     if (ceiling === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = ceiling;
     await worker.stop();

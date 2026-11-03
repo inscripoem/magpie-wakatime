@@ -77,9 +77,9 @@ bun src/sync.mjs status  [--directory <Magpie 配置目录>]
 bun src/sync.mjs preview [--directory <Magpie 配置目录>] [--limit 5]
 ```
 
-发布到 npm 后，同名的 `magpie-wakatime` 命令等价。
+也可以把 GitHub 仓库作为 spec 直接安装，不必发布到 npm：`magpie plugin add github:inscripoem/magpie-wakatime#<ref>`，`<ref>` 可以是分支或提交；固定到具体提交可保证行为可复现。
 
-`status` 显示队列数量、扫描进度、最后确认时间和错误类别；`preview` 打印脱敏后的待发送映射，不访问 WakaTime。状态库在 `<Magpie 配置目录>/magpie-wakatime/state.sqlite`。
+`status` 显示同步状态、扫描游标、最后确认时间和错误类别；`preview` 暂无待发送队列可显示。状态保存在 `<Magpie 配置目录>/magpie-wakatime/` 下：`state.json`（逐日扫描游标，并冗余 salt、网关与首次启用时间）、`identity.json`（salt、网关地址、首次启用时间）、`owner.lock/`（单实例上传锁）。这些文件只属于本机，不要手工编辑，也不要跨机器同步。
 
 单条记录的时间或 token 数据无效时跳过该条，继续采集。`status.lastInvalidRow` 保留最近一次异常的日期、分页偏移、加盐摘要 ID 和错误类别，不保存原始内容；记录修正后可在后续复查中重新采集。整页响应格式错误仍会停止并保留游标，等待接口恢复。
 
