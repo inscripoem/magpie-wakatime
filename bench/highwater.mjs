@@ -14,6 +14,9 @@ import { sourceId } from "../src/map.mjs";
 const REQUESTS = Number(process.env.REQUESTS ?? 18_000);
 const CONTEXTS = process.env.CONTEXTS !== "0";
 const IDLE = process.env.IDLE === "1";
+// Every Nth WakaTime POST returns 500. This exercises the failure path:
+// unacknowledged rows go to the durable queue, then drain with backoff.
+const FAIL_EVERY = Number(process.env.FAIL_EVERY ?? 0);
 const TICK_MS = 30_000;
 const DAY_START = new Date(2026, 10, 3, 0, 0, 0).getTime();
 const ROOT = new URL("../.work/bench/", import.meta.url).pathname;
@@ -71,6 +74,7 @@ const rows = IDLE ? [] : generate();
 const visible = [];
 let nextRow = 0;
 let heartbeats = 0;
+let posts = 0;
 
 // The two days before the measured day are already complete. Their cursors
 // make the ten-minute review read two pages per day and write nothing.
@@ -111,11 +115,22 @@ const worker = new Sync(DIRECTORY, options, {
   },
   fetcher: async (_url, init) => {
     const body = JSON.parse(init.body);
+    posts++;
     heartbeats += body.length;
+    if (FAIL_EVERY > 0 && posts % FAIL_EVERY === 0) {
+      return new Response(null, { status: 500 });
+    }
     return Response.json({ responses: body.map(() => [{ data: {} }, 201]) }, { status: 201 });
   },
 });
 worker.state.activate(options.gatewayUrl, DAY_START);
+// Count the queue's committed transactions so the write volume can be read
+// alongside the commit pattern instead of inferred from syscalls alone.
+const transactions = { enqueue: 0, ack: 0, defer: 0, pruneAcked: 0 };
+for (const name of Object.keys(transactions)) {
+  const original = worker.queue[name].bind(worker.queue);
+  worker.queue[name] = (...args) => { transactions[name]++; return original(...args); };
+}
 // Live steady state keeps one cursor per replay day. Seed the two older days
 // so the measured file size is not the first-day minimum.
 const seeded = [];
@@ -163,6 +178,12 @@ if (nextRow < rows.length) {
   await worker.tick(now);
   ticks++;
 }
+// A final sub-25 buffer flushes at the one-window boundary.
+await worker.tick(DAY_START + 86_400_000 + 60_000);
+ticks++;
+// Capture the live WAL before stop() checkpoints it away.
+const live = directoryBytes(STATE_DIRECTORY);
+const queue = worker.queue.status();
 await worker.stop();
 const elapsed = Date.now() - started;
 const after = ioCounters();
@@ -173,6 +194,8 @@ const result = {
   mode: IDLE ? "highwater-idle" : "highwater",
   requests: rows.length,
   heartbeats,
+  posts,
+  fail_every: FAIL_EVERY,
   ticks,
   contexts: CONTEXTS,
   elapsed_ms: elapsed,
@@ -183,10 +206,15 @@ const result = {
   rchar: (after.rchar ?? 0) - (before.rchar ?? 0),
   state_writes: worker.state.stateWrites,
   lease_writes: worker.state.leaseWrites,
+  transactions,
+  total_transactions: transactions.enqueue + transactions.ack,
+  live_state_files: live.files,
+  live_state_bytes: live.total,
   state_files: state.files,
   state_bytes: state.total,
   seeded_cursors: seeded.length,
   cursor,
+  queue,
   sent: worker.stats.sent,
   rejected: worker.stats.rejected,
 };

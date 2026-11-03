@@ -4,14 +4,19 @@ import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { hostname } from "node:os";
 import { State } from "./state.mjs";
-import { Contexts } from "./contexts.mjs";
+import { Contexts, CONTEXT_TTL_MS } from "./contexts.mjs";
+import { Queue, QueueFullError, QUEUE_CAPACITY, ACK_RETENTION_MS, queueStatus } from "./queue.mjs";
+import { BATCH_ROWS, EnqueueBuffer, AckGate } from "./batching.mjs";
 import { collectDay, localDay } from "./source.mjs";
 import { readApiKey, defaultDirectory } from "./config.mjs";
 import { defaultUserAgent } from "./user-agent.mjs";
 
-const BATCH = 25;
 const SCAN_MS = 30_000;
 const REVIEW_MS = 10 * 60_000;
+// A tick reads at most this many 25-row windows across backfill, today and
+// reviews. The cap bounds source reads and HTTP work per tick; the cursor
+// keeps exact progress between ticks.
+const SCAN_WINDOWS = 32;
 const PRUNE_MS = 6 * 3_600_000;
 const SEEN_TTL_MS = 3 * 86_400_000;
 const SEEN_CAPACITY = 60_000;
@@ -23,9 +28,9 @@ export function retryDelay(attempt, header, now) {
   return Math.max(5000, Math.min(300_000, backoff * (0.8 + Math.random() * 0.4)), Number.isFinite(server) ? server : 0);
 }
 
-// Process-local memory of rows already offered. It keeps partial scans and
-// restarted cursors from resending rows during the same run. It is not
-// durable: a restart deliberately replays from the cursor.
+// Process-local memory of rows already offered. It is a performance cache
+// only: the durable queue dedupes by source id, so correctness never depends
+// on this surviving a restart.
 export class Seen {
   constructor({ ttl = SEEN_TTL_MS, capacity = SEEN_CAPACITY } = {}) {
     this.ttl = ttl;
@@ -101,14 +106,23 @@ function permanent(code) {
 export class Sync {
   constructor(directory, options, {
     env = process.env, enabled = () => true, fetcher = fetch, sourceFetcher = fetch, now = Date.now(),
+    queueCapacity = QUEUE_CAPACITY,
   } = {}) {
     const stateDirectory = join(directory, "magpie-wakatime");
     mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
     this.state = new State(join(stateDirectory, "state.json"), { now });
-    this.contexts = new Contexts({ ttl: 120_000 });
+    this.contexts = new Contexts({
+      ttl: CONTEXT_TTL_MS, journal: join(stateDirectory, "contexts.log"), now,
+    });
+    this.queue = new Queue(join(stateDirectory, "queue.sqlite"), { capacity: queueCapacity });
+    // A's buffer and staged commits are reused unchanged: mapped rows wait
+    // here until 25 rows or one window, and no cursor moves past them.
+    this.buffer = new EnqueueBuffer();
+    this.ackGate = new AckGate();
+    // Cursor and backfill commits that cover rows still sitting in the buffer.
+    // They run only after the buffer is fully handled.
+    this.pendingCommits = [];
     this.seen = new Seen();
-    this.retry = [];
-    this.retryIds = new Set();
     this.directory = directory;
     this.options = options;
     this.env = env;
@@ -146,157 +160,239 @@ export class Sync {
     });
   }
 
-  collectOptions(now) {
+  // Each call maps at most the free room in the 25-row buffer, so the buffer
+  // can never exceed the flush threshold and the crash duplicate bound stays
+  // at one flush. The source returns the cursor for exactly that prefix.
+  collectOptions(now, limit = BATCH_ROWS) {
     return {
       now, signal: this.abort.signal, fetcher: this.sourceFetcher,
-      contexts: this.contexts, seen: this.seen, retryIds: this.retryIds, budget: 20,
+      contexts: this.contexts, seen: this.seen, budget: 20, limit,
     };
   }
 
-  async sendItems(key, items, now) {
-    if (!items.length) return { ok: true, sent: 0 };
-    // A row waiting in the retry queue is not acknowledged: its day's cursor
-    // must stay behind so a restart cannot forget it. Rows whose retry already
-    // succeeded are in seen and no longer counted here.
-    const pending = items.some((item) => this.retryIds.has(item.id));
-    let sent = 0;
-    for (let start = 0; start < items.length; start += BATCH) {
-      const live = items.slice(start, start + BATCH)
-        .filter((item) => !this.seen.has(item.id) && !this.retryIds.has(item.id));
-      if (!live.length) continue;
-      const result = await postChunk(key, live, { now, fetcher: this.fetcher, signal: this.abort.signal });
-      if (result.aborted) return { ok: false, sent };
+  // Persist rows that a direct send could not deliver. One transaction covers
+  // the whole remainder: either every row becomes durable or the caller leaves
+  // the cursor behind all of them. The enqueue window is bypassed because a
+  // failed send needs durability immediately.
+  persist(items, now) {
+    if (!items.length) return true;
+    try {
+      this.queue.enqueue(items, now);
+      this.state.setDiagnostic("queueError", null);
+      return true;
+    } catch (error) {
+      this.state.setDiagnostic("queueError",
+        error instanceof QueueFullError ? "queue-full" : "enqueue-failed");
+      this.state.setDiagnostic("runtime", "backlog");
+      return false;
+    }
+  }
+
+  // Option A's staged commits: a cursor or backfill advance waits until no
+  // mapped row is still in the buffer, so a committed cursor never passes an
+  // unsent row. Applying a commit also flushes the state.
+  stage(commit, now) {
+    this.pendingCommits.push(commit);
+    this.applyCommits(now);
+  }
+
+  applyCommits(now) {
+    if (this.buffer.length || !this.pendingCommits.length) return false;
+    const commits = this.pendingCommits;
+    this.pendingCommits = [];
+    for (const commit of commits) commit();
+    if (now !== undefined) this.state.flush(now, true);
+    return true;
+  }
+
+  // Send the buffered rows directly in BATCH_ROWS requests. The buffer is
+  // cleared and the staged cursors apply only after every buffered row is
+  // delivered (2xx), permanently rejected (4xx), or durable in one queue
+  // transaction. Buffered rows are never durable themselves, so a crash after
+  // a 2xx but before the cursor flush re-sends at most the current buffer.
+  async flushBuffer(now, key) {
+    if (!this.buffer.ready(now)) return "idle";
+    const items = this.buffer.items.slice();
+    for (let start = 0; start < items.length; start += BATCH_ROWS) {
+      const batch = items.slice(start, start + BATCH_ROWS);
+      const result = await postChunk(key, batch, { now, fetcher: this.fetcher, signal: this.abort.signal });
+      if (result.aborted) return "aborted";
       if (result.auth) {
+        // Every unacknowledged row of this buffer must be durable before the
+        // worker pauses; otherwise the buffer stays and the cursor behind it.
         this.blockedKey = key;
         this.state.setDiagnostic("credentials", "invalid-key");
         this.state.setDiagnostic("sendError", result.error);
-        return { ok: false, sent, auth: true };
+        if (!this.persist(items.slice(start), now)) return "blocked";
+        this.finishBuffer(now);
+        return "auth";
       }
-      const failed = [];
-      for (let index = 0; index < live.length; index++) {
-        const item = live[index], code = result.codes[index];
-        if (code >= 200 && code < 300) {
-          this.seen.add(item.id, now);
-          this.stats.sent++;
-          sent++;
-        } else if (permanent(code)) {
-          this.seen.add(item.id, now);
-          this.stats.rejected++;
-        } else {
-          failed.push(item);
-        }
+      const sent = [], rejected = [], deferred = [];
+      for (let index = 0; index < batch.length; index++) {
+        const item = batch[index], code = result.codes[index];
+        if (code >= 200 && code < 300) sent.push(item);
+        else if (permanent(code)) rejected.push(item);
+        else deferred.push(item);
       }
-      if (failed.length) {
-        this.enqueueRetry(failed, now, result.retryAfter);
+      this.stats.sent += sent.length;
+      this.stats.rejected += rejected.length;
+      if (deferred.length) {
+        // Stop direct sending at the first transient failure. Only the
+        // unacknowledged rows of this buffer become durable, in one
+        // transaction that bypasses the 60-second enqueue window.
+        const pending = [...deferred, ...items.slice(start + batch.length)];
         this.state.setDiagnostic("sendError", result.error ?? "wakatime-transient");
-        return { ok: false, sent };
+        if (!this.persist(pending, now)) return "blocked";
+        this.finishBuffer(now);
+        return "queued";
       }
     }
-    this.stats.lastConfirmedAt = now;
-    this.state.setDiagnostic("sendError", null);
-    return { ok: !pending, sent };
-  }
-
-  enqueueRetry(items, now, retryAfter) {
-    const fresh = items.filter((item) => !this.retryIds.has(item.id));
-    if (!fresh.length) return;
-    for (const item of fresh) this.retryIds.add(item.id);
-    this.retry.push({ items: fresh, attempts: 0, nextAt: now + retryDelay(0, retryAfter, now) });
-  }
-
-  async flushRetries(key, now) {
-    if (!this.retry.length) return { ok: true };
-    const kept = [];
-    for (const entry of this.retry) {
-      for (const item of entry.items) {
-        if (this.seen.has(item.id)) this.retryIds.delete(item.id);
-      }
-      entry.items = entry.items.filter((item) => !this.seen.has(item.id));
-      if (!entry.items.length) continue;
-      if (entry.nextAt > now) { kept.push(entry); continue; }
-      const result = await postChunk(key, entry.items, { now, fetcher: this.fetcher, signal: this.abort.signal });
-      if (result.aborted) { kept.push(entry); continue; }
-      if (result.auth) {
-        this.blockedKey = key;
-        this.state.setDiagnostic("credentials", "invalid-key");
-        kept.push(entry);
-        return { ok: false, auth: true };
-      }
-      const failed = [];
-      for (let index = 0; index < entry.items.length; index++) {
-        const item = entry.items[index], code = result.codes[index];
-        if (code >= 200 && code < 300) {
-          this.seen.add(item.id, now);
-          this.stats.sent++;
-          this.retryIds.delete(item.id);
-        } else if (permanent(code)) {
-          this.seen.add(item.id, now);
-          this.stats.rejected++;
-          this.retryIds.delete(item.id);
-        } else {
-          failed.push(item);
-        }
-      }
-      if (failed.length) {
-        entry.items = failed;
-        entry.nextAt = now + retryDelay(entry.attempts++, result.retryAfter, now);
-        kept.push(entry);
-        this.state.setDiagnostic("sendError", result.error ?? "wakatime-transient");
-      }
+    // A clean buffer confirms the send only when no older offline row waits.
+    if (this.queue.pendingCount() === 0) {
+      this.stats.lastConfirmedAt = now;
+      this.state.setDiagnostic("sendError", null);
     }
-    this.retry = kept;
-    if (kept.length) return { ok: false };
-    this.stats.lastConfirmedAt = now;
-    this.state.setDiagnostic("sendError", null);
-    return { ok: true };
+    this.finishBuffer(now);
+    return "ok";
+  }
+
+  // The whole buffer is handled: drop it, then let the staged cursors move.
+  finishBuffer(now) {
+    this.buffer.clear();
+    this.applyCommits(now);
+  }
+
+  // Buffer mapped rows across stable scans exactly like option A, marking them
+  // seen immediately so a re-read from the unchanged cursor skips them. A full
+  // buffer leaves the rest of the scan result for a later pass.
+  async bufferItems(items, now, key) {
+    const accepted = this.buffer.add(items, now);
+    for (let index = 0; index < accepted.length; index++) this.seen.add(accepted[index].id, now);
+    if (!this.buffer.ready(now)) return { accepted: accepted.length, status: "idle" };
+    return { accepted: accepted.length, status: await this.flushBuffer(now, key) };
+  }
+
+  // Process one day in windows. Each collectDay call names the cursor for the
+  // rows it mapped; the staged commit applies only after the buffer sends or
+  // durably enqueues them. Returns the windows used and whether the day ended.
+  async scanDay(target, now, key, budget, kind) {
+    let used = 0;
+    while (used < budget) {
+      const limit = Math.max(1, BATCH_ROWS - this.buffer.length);
+      const result = await collectDay(this.state, this.options, target, this.collectOptions(now, limit));
+      used++;
+      if (!result.stable) return { used, stop: true };
+      const { accepted, status } = await this.bufferItems(result.items, now, key);
+      if (accepted < result.items.length) return { used, stop: true };
+      const next = result.complete && kind === "backfill"
+        ? localDay(`${target}T12:00:00`, 1) : null;
+      this.stage(() => {
+        this.state.setCursor(target, result.cursor);
+        if (result.complete) {
+          if (kind === "today") {
+            this.state.set("backfillDay", target);
+          } else if (kind === "backfill") {
+            const last = this.state.get("lastCompleteDay");
+            if (!last || target > last) this.state.set("lastCompleteDay", target);
+            this.state.set("backfillDay", next);
+          }
+        }
+      }, now);
+      // A queued failure, a paused key or an unfixable buffer ends the pass.
+      if (status !== "ok" && status !== "idle") return { used, stop: true };
+      if (result.complete) return { used, complete: true };
+    }
+    return { used, complete: false };
   }
 
   async scan(now, key) {
+    if (this.buffer.full) return;
     const firstDay = localDay(this.state.get("enabledAt"));
     const today = localDay(now);
     let day = this.state.get("backfillDay") ?? firstDay;
     if (day > today) day = today;
+    let budget = SCAN_WINDOWS;
 
-    for (let count = 0; count < 3 && day < today; count++) {
-      const result = await collectDay(this.state, this.options, day, this.collectOptions(now));
-      const sent = await this.sendItems(key, result.items, now);
-      if (sent.auth) return;
-      if (result.complete && sent.ok && !result.pendingRetry) {
-        this.state.setCursor(day, result.cursor);
-        const last = this.state.get("lastCompleteDay");
-        if (!last || day > last) this.state.set("lastCompleteDay", day);
-        day = localDay(`${day}T12:00:00`, 1);
-        this.state.set("backfillDay", day);
-      } else {
-        break;
-      }
+    for (let count = 0; count < 3 && day < today && budget > 0; count++) {
+      const target = day;
+      const outcome = await this.scanDay(target, now, key, budget, "backfill");
+      budget -= outcome.used;
+      if (outcome.stop) return;
+      if (!outcome.complete) return;
+      day = localDay(`${target}T12:00:00`, 1);
     }
 
-    if (day >= today) {
-      const result = await collectDay(this.state, this.options, today, this.collectOptions(now));
-      const sent = await this.sendItems(key, result.items, now);
-      if (sent.auth) return;
-      if (result.complete && sent.ok && !result.pendingRetry) {
-        this.state.setCursor(today, result.cursor);
-        this.state.set("backfillDay", today);
-      }
+    if (day >= today && budget > 0) {
+      const outcome = await this.scanDay(today, now, key, budget, "today");
+      budget -= outcome.used;
+      if (outcome.stop || !outcome.complete) return;
     }
 
     // A day that has already been completed can still receive a request that
     // finished late. Its cursor makes the check cheap: an unchanged head and
     // total means two page reads and no write. Only days with a cursor are
     // reviewed here; an older day without one is still handled by backfill.
-    if (now >= this.nextReview) {
+    if (now >= this.nextReview && budget > 0) {
       this.nextReview = now + REVIEW_MS;
       for (const offset of [-1, -2]) {
-        const day = localDay(now, offset);
-        if (day < firstDay || !this.state.cursor(day)) continue;
-        const result = await collectDay(this.state, this.options, day, this.collectOptions(now));
-        const sent = await this.sendItems(key, result.items, now);
-        if (sent.auth) return;
-        if (result.complete && sent.ok && !result.pendingRetry) this.state.setCursor(day, result.cursor);
+        if (budget <= 0) break;
+        const target = localDay(now, offset);
+        if (target < firstDay || !this.state.cursor(target)) continue;
+        const outcome = await this.scanDay(target, now, key, budget, "review");
+        budget -= outcome.used;
+        if (outcome.stop) return;
       }
     }
+  }
+
+  // Send the oldest due entries. The gate holds a small trickle for at most
+  // one window, while a full batch opens immediately; once open, every due
+  // batch is sent and acknowledged before the next request. Acks are durable
+  // before the next batch is requested; transient failures stay queued with a
+  // backoff.
+  async drain(key, now) {
+    if (this.queue.pendingCount() === 0) {
+      this.stats.lastConfirmedAt = now;
+      this.state.setDiagnostic("sendError", null);
+      return { ok: true };
+    }
+    if (!this.ackGate.open(this.queue.pendingDue(now), now)) return { ok: false, gated: true };
+    for (;;) {
+      const entries = this.queue.pending(now, BATCH_ROWS);
+      if (!entries.length) {
+        // Deferred entries are still pending, just not due yet: keep the last
+        // transient error visible instead of reporting a clean queue.
+        if (this.queue.pendingCount() > 0) return { ok: false };
+        break;
+      }
+      const result = await postChunk(key, entries, { now, fetcher: this.fetcher, signal: this.abort.signal });
+      if (result.aborted) return { ok: false, sent: 0 };
+      if (result.auth) {
+        this.blockedKey = key;
+        this.state.setDiagnostic("credentials", "invalid-key");
+        this.state.setDiagnostic("sendError", result.error);
+        return { ok: false, auth: true };
+      }
+      const sentIds = [], rejectedIds = [], deferred = [];
+      for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index], code = result.codes[index];
+        if (code >= 200 && code < 300) sentIds.push(entry.id);
+        else if (permanent(code)) rejectedIds.push(entry.id);
+        else deferred.push(entry);
+      }
+      if (sentIds.length || rejectedIds.length) this.queue.ack([...sentIds, ...rejectedIds], now);
+      this.stats.sent += sentIds.length;
+      this.stats.rejected += rejectedIds.length;
+      if (deferred.length) {
+        const attempts = deferred.reduce((max, entry) => Math.max(max, entry.attempts), 0);
+        this.queue.defer(deferred, now + retryDelay(attempts, result.retryAfter, now));
+        this.state.setDiagnostic("sendError", result.error ?? "wakatime-transient");
+        return { ok: false };
+      }
+    }
+    this.stats.lastConfirmedAt = now;
+    this.state.setDiagnostic("sendError", null);
+    return { ok: true };
   }
 
   async tick(now = Date.now()) {
@@ -345,28 +441,68 @@ export class Sync {
     if (this.sourceBlocked) return;
     if (key === this.blockedKey) { this.persistContextStats(); this.state.flush(now); return; }
 
-    this.contexts.prune(now);
+    this.contexts.maintain(now);
     this.seen.prune(now);
     if (now >= this.nextPrune) {
       this.nextPrune = now + PRUNE_MS;
       this.state.pruneCursors(localDay(now, -3));
-    }
-
-    const retried = await this.flushRetries(key, now);
-    if (retried.auth) return;
-
-    if (now >= this.nextScan) {
-      this.nextScan = now + SCAN_MS;
-      try {
-        await this.scan(now, key);
-        this.state.setDiagnostic("sourceError", null);
-      } catch (error) {
-        this.state.setDiagnostic("sourceError",
-          /^(source-|invalid-row)/.test(error.message) ? error.message : "scan-stopped");
+      // While an old backfill day is still unscanned, a cursor reset can
+      // re-read it. Keep its acknowledgement tombstones even past the normal
+      // retention so those rows cannot be re-sent.
+      const backlogStart = this.state.get("backfillDay") ?? localDay(this.state.get("enabledAt"));
+      if (!backlogStart || backlogStart >= localDay(now, -3)) {
+        this.queue.pruneAcked(now - ACK_RETENTION_MS);
       }
     }
+
+    // A buffer that reached 25 rows or one window is sent directly before any
+    // new scan. A failure durably queues it, then the offline queue drains.
+    if (this.buffer.length) {
+      const status = await this.flushBuffer(now, key);
+      if (status !== "ok" && status !== "idle") {
+        // A blocked enqueue usually means the offline queue is full; draining
+        // it is what frees room for the next attempt. A key pause never drains.
+        if ((status === "queued" || status === "blocked") && this.queue.pendingCount() > 0) {
+          await this.drain(key, now);
+        }
+        this.persistContextStats();
+        this.state.flush(now, true);
+        this.state.flush(now);
+        return;
+      }
+    }
+    // Offline rows go next. A restart finishes the durable queue before
+    // reading new rows, and the cursor already sits after those rows.
+    if (this.queue.pendingCount() > 0) {
+      const drained = await this.drain(key, now);
+      if (drained.auth) {
+        this.persistContextStats();
+        this.state.flush(now, true);
+        this.state.flush(now);
+        return;
+      }
+    }
+    if (now >= this.nextScan) {
+      this.nextScan = now + SCAN_MS;
+      if (this.queue.status().full) {
+        this.state.setDiagnostic("queueError", "queue-full");
+        this.state.setDiagnostic("runtime", "backlog");
+      } else {
+        try {
+          await this.scan(now, key);
+          this.state.setDiagnostic("sourceError", null);
+        } catch (error) {
+          this.state.setDiagnostic("sourceError",
+            /^(source-|invalid-row)/.test(error.message) ? error.message : "scan-stopped");
+        }
+      }
+    }
+    // The direct path already flushed each advanced cursor. Diagnostics and
+    // any commit that did not run still ride this flush.
     this.persistContextStats();
+    this.state.flush(now, true);
     this.state.flush(now);
+    if (key !== this.blockedKey && this.queue.pendingCount() > 0) await this.drain(key, now);
   }
 
   start() {
@@ -391,6 +527,11 @@ export class Sync {
     this.state.flush(Date.now(), true);
     this.state.release(this.owner);
     this.hasLease = false;
+    this.close();
+  }
+
+  close() {
+    try { this.queue.close(); } catch { /* already closed */ }
   }
 
   status(now = Date.now()) {
@@ -399,9 +540,9 @@ export class Sync {
       ...this.stats,
       active: this.hasLease,
       contextStats: { hook: { ...this.hookStats }, lookup: this.contexts.stats() },
-      pendingRetry: this.retry.length,
       contexts: this.contexts.size(),
       seen: this.seen.size,
+      queue: this.queue.status(),
     };
   }
 }
@@ -444,7 +585,10 @@ function cli(args) {
     console.log(JSON.stringify([], null, 2));
     return;
   }
-  console.log(JSON.stringify({ ...identity, ...data, active }, null, 2));
+  const output = { ...identity, ...data, active };
+  const queue = queueStatus(join(stateDirectory, "queue.sqlite"));
+  if (queue) output.queue = queue;
+  console.log(JSON.stringify(output, null, 2));
 }
 
 if (import.meta.main) {

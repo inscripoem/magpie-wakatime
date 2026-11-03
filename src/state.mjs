@@ -11,6 +11,7 @@ export const LOCK_TTL_MS = 10 * 60_000;
 const LOCK_CACHE_MS = 60_000;
 const LOCK_STALE_MS = 60_000;
 const OWNER_FILE = "owner.json";
+const DURABLE_DIAGNOSTICS = new Set(["credentials", "sendError", "queueError"]);
 
 function readJson(file) {
   try { return JSON.parse(readFileSync(file, "utf8")); }
@@ -110,8 +111,9 @@ function cursorToArray(cursor) {
 }
 
 // Everything the worker needs between restarts, kept in small JSON files.
-// Per-request contexts and dedupe ids are deliberately absent: contexts live
-// in memory, and the per-day cursor is the only durable replay boundary.
+// The cursor is the scan boundary; heartbeat payloads and acknowledgement
+// tombstones live in the durable queue database. Request contexts live in
+// their own append-only journal, not here.
 export class State {
   constructor(file, {
     lockDirectory = file.replace(/state\.json$/, "owner.lock"),
@@ -150,6 +152,7 @@ export class State {
     // file dirty on their own, so an idle worker performs no state writes.
     this.diagnostics = disk.diagnostics && typeof disk.diagnostics === "object" ? { ...disk.diagnostics } : {};
     this.dirty = false;
+    this.diagnosticsDirty = false;
     this.lastFlush = now;
     this.stateWrites = 0;
     this.leaseWrites = 0;
@@ -208,6 +211,7 @@ export class State {
     if (JSON.stringify(previous ?? null) === JSON.stringify(value ?? null)) return false;
     if (value === null || value === undefined) delete this.diagnostics[key];
     else this.diagnostics[key] = value;
+    if (DURABLE_DIAGNOSTICS.has(key)) this.diagnosticsDirty = true;
     return true;
   }
 
@@ -260,8 +264,8 @@ export class State {
   }
 
   flush(now = Date.now(), force = false) {
-    if (!this.dirty) return false;
-    if (!force && now - this.lastFlush < FLUSH_MS) return false;
+    if (!this.dirty && !this.diagnosticsDirty) return false;
+    if (!force && now - this.lastFlush < FLUSH_MS && !this.diagnosticsDirty) return false;
     const cursors = {};
     for (const [day, cursor] of Object.entries(this.cursors)) cursors[day] = cursorToArray(cursor);
     // salt/gateway/enabledAt are repeated here so a lost identity.json is
@@ -275,6 +279,7 @@ export class State {
     if (Object.keys(this.diagnostics).length) data.diagnostics = this.diagnostics;
     writeAtomic(this.file, JSON.stringify(data));
     this.dirty = false;
+    this.diagnosticsDirty = false;
     this.lastFlush = now;
     this.stateWrites++;
     return true;

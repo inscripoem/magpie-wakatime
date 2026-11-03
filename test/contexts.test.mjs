@@ -13,7 +13,7 @@ test("counts response, session, miss, no-key and expired lookups", () => {
   expect(contexts.get({ agent: "claude" }, 10)).toBeNull();
   expect(contexts.get({ agent: "claude", response_id: "r1" }, 2000)).toBeNull();
   expect(contexts.stats()).toEqual({
-    responseHit: 1, sessionHit: 1, miss: 2, pruned: 0, expired: 1, noKey: 1,
+    responseHit: 1, sessionHit: 1, miss: 2, pruned: 0, expired: 1, noKey: 1, journalErrors: 0,
   });
   contexts.prune(3000);
   expect(contexts.stats().pruned).toBe(1);

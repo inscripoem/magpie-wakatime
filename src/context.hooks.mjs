@@ -88,7 +88,6 @@ export async function onResponse(reply, ctx) {
   }
   const response = reply?.id || reply?.responseId;
   try {
-    worker.contexts.setResponse(ctx.agent, response, ctx.state.wakatime);
-    if (typeof ctx.session === "string") worker.contexts.setSession(ctx.agent, ctx.session, ctx.state.wakatime);
+    worker.contexts.record(ctx.agent, { response, session: ctx.session }, ctx.state.wakatime);
   } catch { /* Usage polling continues when a best-effort notification is lost. */ }
 }

@@ -93,18 +93,21 @@ test("picks up front insertions, tail appends and middle late rows without resen
   const now = Date.parse(`${day}T12:00:00+08:00`);
   try {
     const first = await collectDay(state, options, day, { now, fetcher: gateway(rows), contexts, seen });
+    expect(first.stable).toBe(true);
     for (const item of first.items) seen.add(item.id, now);
     state.setCursor(day, first.cursor);
 
     rows.unshift(row(11)); // new front row
     let next = await collectDay(state, options, day, { now, fetcher: gateway(rows), contexts, seen });
     expect(next.items.map((item) => item.id)).toEqual([sourceId(rows[0], state.salt)]);
+    expect(next.stable).toBe(true);
     for (const item of next.items) seen.add(item.id, now);
     state.setCursor(day, next.cursor);
 
     rows.push(row(7)); // late row appended at the tail
     next = await collectDay(state, options, day, { now, fetcher: gateway(rows), contexts, seen });
     expect(next.items.map((item) => item.id)).toEqual([sourceId(rows.at(-1), state.salt)]);
+    expect(next.stable).toBe(true);
     for (const item of next.items) seen.add(item.id, now);
     state.setCursor(day, next.cursor);
 

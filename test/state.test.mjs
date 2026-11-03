@@ -48,6 +48,18 @@ test("does not rewrite state until the flush interval when only diagnostics chan
   });
 });
 
+test("persists send and credential diagnostics outside the cursor interval", () => {
+  withState((file) => {
+    const state = new State(file, { now: 1000 });
+    state.setDiagnostic("sendError", "wakatime-transient");
+    expect(state.flush(30_000)).toBe(true);
+    expect(JSON.parse(readFileSync(file, "utf8")).diagnostics.sendError).toBe("wakatime-transient");
+    state.setDiagnostic("credentials", "invalid-key");
+    expect(state.flush(31_000)).toBe(true);
+    expect(JSON.parse(readFileSync(file, "utf8")).diagnostics.credentials).toBe("invalid-key");
+  });
+});
+
 test("prunes cursors outside the replay window", () => {
   withState((file) => {
     const state = new State(file, { now: 1000 });
@@ -157,6 +169,7 @@ test("carries identity fields in cursor flushes so either state file restores th
     expect(raw.salt).toBe(state.salt);
     expect(raw.gateway).toBe("http://127.0.0.1:3425");
     expect(raw.enabledAt).toBe(2000);
+    expect(raw.recent).toBeUndefined();
     expect(readdirSync(directory).some((name) => name.endsWith(".tmp"))).toBe(false);
     rmSync(file.replace("state.json", "identity.json"), { force: true });
     const restored = new State(file, { now: 500_000 });

@@ -11,7 +11,7 @@ import { tempDirectory } from "./helpers.mjs";
 const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", windowsHide: true });
 const values = (worker) => worker.contexts.values();
 
-test("matches the client response ID in memory and loses the context on restart", async () => {
+test("matches the client response ID in memory and across a restart", async () => {
   const directory = tempDirectory(), repo = join(directory, "real-repo"), nested = join(repo, "src");
   mkdirSync(nested, { recursive: true });
   git(repo, "init", "-q", "--initial-branch=main");
@@ -42,18 +42,28 @@ test("matches the client response ID in memory and loses the context on restart"
     expect(live.items.slice(1).map((item) => item.payload.project)).toEqual(["Magpie", "Magpie"]);
     expect(live.items[1].payload.branch).toBeUndefined();
 
+    // The journal makes the context survive an unclean restart, so a replayed
+    // row keeps its project and language instead of degrading to the fallback.
     const restarted = new Sync(directory, options);
-    const lost = await collectDay(restarted.state, options, localDay(now), {
+    const recovered = await collectDay(restarted.state, options, localDay(now), {
       now, fetcher: async () => Response.json({ rows, total: rows.length, offset: 0 }),
       contexts: restarted.contexts, seen: new Seen(),
     });
-    expect(lost.items.map((item) => item.payload.project)).toEqual(["Magpie", "Magpie", "Magpie"]);
+    expect(recovered.items.map((item) => item.payload.project)).toEqual(["real-repo", "Magpie", "Magpie"]);
+    expect(recovered.items[0].payload).toMatchObject({
+      project: "real-repo", branch: "main", language: "TypeScript",
+    });
     restarted.stopped = true;
+    restarted.close();
 
     const raw = readFileSync(join(directory, "magpie-wakatime", "state.json"), "utf8");
     for (const secret of [directory, "private-prompt", "private-answer", "resp-original", "private-session"]) {
       expect(raw).not.toContain(secret);
     }
+    const journal = readFileSync(join(directory, "magpie-wakatime", "contexts.log"), "utf8");
+    expect(journal).not.toContain(directory);
+    expect(journal).not.toContain("private-prompt");
+    expect(journal).not.toContain("private-answer");
   } finally {
     await worker.stop();
     rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
@@ -204,13 +214,13 @@ test("keeps only the language in memory, not the file path or the file body", as
   }
 });
 
-test("expires a context after two minutes", async () => {
+test("expires a context after ten minutes", async () => {
   const directory = tempDirectory();
   const worker = new Sync(directory, readOptions());
   try {
     worker.contexts.setResponse("codex", "resp", { project: "repo" }, 1000);
     expect(worker.contexts.get({ agent: "codex", response_id: "resp" }, 60_000)).toEqual({ project: "repo" });
-    expect(worker.contexts.get({ agent: "codex", response_id: "resp" }, 121_001)).toBeNull();
+    expect(worker.contexts.get({ agent: "codex", response_id: "resp" }, 601_001)).toBeNull();
     expect(worker.contexts.size()).toBe(0);
   } finally {
     await worker.stop();

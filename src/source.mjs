@@ -41,31 +41,45 @@ function timestamp(row) {
 
 // A contiguous scan of [start, end). Every row seen in the range is offered
 // unless it is already known, filtered out, or predates activation. The caller
-// sends the offers; only then may the returned cursor be committed.
+// sends the offers; only then may the returned cursor be committed. `limit`
+// caps the mapped offers per call: the returned cursor names exactly the
+// processed prefix, including rows skipped as already seen or filtered, so a
+// window can commit without waiting for the rest of the listing.
 async function readRange(state, options, day, start, end, {
-  now, fetcher, signal, contexts, seen, retryIds, budget,
+  now, fetcher, signal, contexts, seen, budget, pass, limit = Infinity,
 }) {
   const salt = state.get("salt");
   const enabledAt = state.get("enabledAt");
-  let offset = start, pages = 0, items = [], lastId = null, lastTime = 0, pendingRetry = false;
+  let offset = start, pages = 0, items = [], lastId = null, lastTime = 0;
   while (offset < end && pages < budget) {
-    const body = await sourcePage(options, day, offset, { fetcher, signal });
+    const pageStart = offset;
+    const body = await sourcePage(options, day, pageStart, { fetcher, signal });
+    // A different total means rows were inserted or removed between pages.
+    if (body.total !== pass.total) pass.unstable = true;
     if (!body.rows.length) break;
-    const stop = Math.min(body.rows.length, end - offset);
+    const stop = Math.min(body.rows.length, end - pageStart);
+    let consumed = 0, full = false;
     for (let index = 0; index < stop; index++) {
       const row = body.rows[index];
       const id = sourceId(row ?? {}, salt);
       lastId = cursorId(id);
       const time = timestamp(row);
       if (time !== null) lastTime = time;
+      consumed = index + 1;
+      // Rows already known from an earlier pass are not newly processed here;
+      // tracking them would mark every later pass unstable forever.
       if (seen?.has(id)) continue;
-      if (retryIds?.has(id)) { pendingRetry = true; continue; }
+      // A row repeated across pages means the listing shifted under the scan.
+      // The set is per pass; the global seen set cannot detect this because a
+      // repeat can still be new to this pass.
+      if (pass.ids.has(id)) pass.unstable = true;
+      else pass.ids.add(id);
       let payload;
       try {
         payload = mapRow(row, options, salt, contexts?.get(row, now) ?? null);
       } catch (error) {
         if (error.message !== "invalid-row") throw error;
-        state.setDiagnostic("lastInvalidRow", { day, offset: offset + index, id, error: "invalid-row" });
+        state.setDiagnostic("lastInvalidRow", { day, offset: pageStart + index, id, error: "invalid-row" });
         seen?.add(id, now);
         continue;
       }
@@ -74,11 +88,13 @@ async function readRange(state, options, day, start, end, {
         continue;
       }
       items.push({ id, payload });
+      if (items.length >= limit) { full = true; break; }
     }
-    offset += stop;
+    offset = pageStart + consumed;
     pages++;
+    if (full) break;
   }
-  return { items, offset, complete: offset >= end, lastId, lastTime, pendingRetry };
+  return { items, offset, complete: offset >= end, lastId, lastTime };
 }
 
 function makeCursor(head, total, range, previous, complete) {
@@ -133,17 +149,20 @@ async function stableHead(options, day, head, total, salt, { fetcher, signal }) 
 }
 
 export async function collectDay(state, options, day, {
-  now = Date.now(), fetcher = fetch, signal, contexts = null, seen = null,
-  retryIds = null, budget = 20,
+  now = Date.now(), fetcher = fetch, signal, contexts = null, seen = null, budget = 20,
+  limit = Infinity,
 } = {}) {
   const enabledAt = state.get("enabledAt");
-  if (enabledAt === null) return { items: [], cursor: null, complete: true };
+  if (enabledAt === null) return { items: [], cursor: null, complete: true, stable: true };
   const salt = state.get("salt");
   const cursor = state.cursor(day);
   const first = await sourcePage(options, day, 0, { fetcher, signal });
   const head = first.rows.length ? cursorId(sourceId(first.rows[0], salt)) : null;
   const total = first.total;
-  const context = { now, fetcher, signal, contexts, seen, retryIds, budget, total };
+  // Shared by every range read in this pass so cross-page repeats and total
+  // changes invalidate the pass for the whole day.
+  const pass = { total, ids: new Set(), unstable: false };
+  const context = { now, fetcher, signal, contexts, seen, budget, total, pass, limit };
 
   let result;
   if (!cursor) {
@@ -152,13 +171,15 @@ export async function collectDay(state, options, day, {
       items: range.items,
       cursor: makeCursor(head, total, range, null, range.complete),
       complete: range.complete,
-      pendingRetry: range.pendingRetry,
+      stable: true,
       reset: true,
     };
   } else if (total === 0) {
-    result = { items: [], cursor: { offset: 0, head: null, tail: null, total: 0, time: 0 }, complete: true };
+    result = {
+      items: [], cursor: { offset: 0, head: null, tail: null, total: 0, time: 0 }, complete: true, stable: true,
+    };
   } else if (head === cursor.head && total === cursor.total && cursor.offset >= total) {
-    result = { items: [], cursor, complete: true };
+    result = { items: [], cursor, complete: true, stable: true };
   } else if (head === cursor.head) {
     if (await verifyTail(state, options, day, cursor, context)) {
       const range = await readRange(state, options, day, cursor.offset, total, context);
@@ -166,7 +187,7 @@ export async function collectDay(state, options, day, {
         items: range.items,
         cursor: makeCursor(head, total, range, cursor, range.complete),
         complete: range.complete,
-        pendingRetry: range.pendingRetry,
+        stable: true,
       };
     } else {
       const range = await readRange(state, options, day, 0, total, context);
@@ -174,7 +195,7 @@ export async function collectDay(state, options, day, {
         items: range.items,
         cursor: makeCursor(head, total, range, null, range.complete),
         complete: range.complete,
-        pendingRetry: range.pendingRetry,
+        stable: true,
         reset: true,
       };
     }
@@ -191,37 +212,51 @@ export async function collectDay(state, options, day, {
         items: range.items,
         cursor: makeCursor(head, total, range, null, range.complete),
         complete: range.complete,
-        pendingRetry: range.pendingRetry,
+        stable: true,
         reset: true,
       };
     } else {
+      // Rows inserted before the old head have to be processed before the
+      // already-processed prefix can be named again. Keep the old cursor on
+      // disk for the whole front: an intermediate front-only cursor would
+      // forget the verified old prefix, so a crash mid-front would restart by
+      // re-reading (and re-sending) that old prefix. Only once the entire
+      // front is processed does the merged cursor name the old prefix at its
+      // new position. A crash mid-front re-reads just the inserted rows.
       const front = await readRange(state, options, day, 0, oldHeadIndex, context);
-      const tailStart = oldHeadIndex + cursor.offset;
-      const tail = tailStart < total
-        ? await readRange(state, options, day, tailStart, total, context)
-        : { items: [], offset: tailStart, complete: true, lastId: null, lastTime: 0 };
-      const complete = front.complete && tail.complete;
-      const previous = tail.lastId ? null : cursor;
-      const combinedRange = {
-        offset: tail.lastId ? tail.offset : tailStart,
-        lastId: tail.lastId ?? cursor.tail,
-        lastTime: tail.lastTime || cursor.time,
-      };
-      result = {
-        items: [...front.items, ...tail.items],
-        cursor: complete ? makeCursor(head, total, combinedRange, previous, true) : cursor,
-        complete,
-        pendingRetry: front.pendingRetry || tail.pendingRetry,
-      };
+      if (front.offset >= oldHeadIndex) {
+        const combinedOffset = oldHeadIndex + cursor.offset;
+        result = {
+          items: front.items,
+          cursor: { offset: combinedOffset, head, tail: cursor.tail, total, time: cursor.time },
+          complete: combinedOffset >= total,
+          stable: true,
+        };
+      } else {
+        result = {
+          items: front.items,
+          cursor,
+          complete: false,
+          stable: true,
+        };
+      }
     }
   }
 
-  if (!result.complete) return result;
+  // A page total change or a repeated id means the listing moved while it was
+  // read. Any cursor from this pass could skip the inserted row, so let the
+  // next pass re-read from the old cursor. The gateway's usage store is
+  // append-only; a same-total rewrite of the middle of a completed day is
+  // outside this detection and the cursor's contract.
+  if (pass.unstable) {
+    return { ...result, cursor, complete: false, stable: false };
+  }
   // Pages shift when another request completes while they are read. A changed
   // head or total means this pass may have skipped or repeated a row; leave the
-  // cursor alone and let the next pass use the seen set.
+  // cursor alone and let the next pass use the seen set. This runs for partial
+  // windows too, so every committed prefix names a stable listing.
   if (!(await stableHead(options, day, head, total, salt, context))) {
-    return { ...result, cursor, complete: false };
+    return { ...result, cursor, complete: false, stable: false };
   }
   return result;
 }
