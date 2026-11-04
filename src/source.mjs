@@ -45,18 +45,39 @@ function timestamp(row) {
 // caps the mapped offers per call: the returned cursor names exactly the
 // processed prefix, including rows skipped as already seen or filtered, so a
 // window can commit without waiting for the rest of the listing.
-// A gateway row only names the client session. Claude Code writes its
-// transcript beside the same id, so a row whose request hook had no cwd can
-// still recover project, branch and language locally. Only a Claude row is
-// consulted; other agents keep the configured fallback.
-function fallbackContext(row, claudeSessions, now) {
-  if (!claudeSessions || typeof row?.agent !== "string" || row.agent.trim() !== "claude") return null;
-  try { return claudeSessions.context(row.native_session || row.session, now); }
-  catch { return null; }
+// A gateway row only names the client session. Claude Code and Codex write
+// local transcripts beside the same id, so a row whose request hook had no cwd
+// can still recover a language (and for Claude, project and branch) locally.
+// Only the matching agent is consulted; others keep the configured fallback.
+async function fallbackContext(row, claudeSessions, codexSessions, now, signal) {
+  if (typeof row?.agent !== "string") return null;
+  const agent = row.agent.trim();
+  const session = row.native_session || row.session;
+  try {
+    if (agent === "claude") return (await claudeSessions?.context(session, now, { signal })) ?? null;
+    if (agent === "codex") return (await codexSessions?.context(session, { signal, now })) ?? null;
+  } catch { return null; }
+  return null;
+}
+
+const CONTEXT_FIELDS = ["project", "branch", "language"];
+
+// The explicit memory/journal context wins field by field; the derived context
+// fills only what it left empty. Both inputs can be cached and read-only, so a
+// merged result is always a fresh object.
+function mergeContext(explicit, derived) {
+  if (!explicit) return derived;
+  if (!derived) return explicit;
+  const merged = { ...derived };
+  for (const name of CONTEXT_FIELDS) {
+    const value = explicit[name];
+    if (value !== undefined && value !== null && value !== "") merged[name] = value;
+  }
+  return merged;
 }
 
 async function readRange(state, options, day, start, end, {
-  now, fetcher, signal, contexts, claudeSessions, seen, budget, pass, limit = Infinity,
+  now, fetcher, signal, contexts, claudeSessions, codexSessions, seen, budget, pass, limit = Infinity,
 }) {
   const salt = state.get("salt");
   const enabledAt = state.get("enabledAt");
@@ -88,11 +109,12 @@ async function readRange(state, options, day, start, end, {
       else pass.ids.add(id);
       let payload;
       try {
-        // An explicit memory/journal context always wins. Only a miss consults
-        // the transcript fallback, and mapRow still lets projectByAgent
-        // override the fallback's project.
-        const context = contexts?.get(row, now) ?? fallbackContext(row, claudeSessions, now);
-        payload = mapRow(row, options, salt, context);
+        // Explicit context wins field by field; a session transcript only
+        // fills the fields it left empty. mapRow still lets projectByAgent
+        // override the project.
+        const explicit = contexts?.get(row, now) ?? null;
+        const derived = await fallbackContext(row, claudeSessions, codexSessions, now, signal);
+        payload = mapRow(row, options, salt, mergeContext(explicit, derived));
       } catch (error) {
         if (error.message !== "invalid-row") throw error;
         state.setDiagnostic("lastInvalidRow", { day, offset: pageStart + index, id, error: "invalid-row" });
@@ -165,8 +187,8 @@ async function stableHead(options, day, head, total, salt, { fetcher, signal }) 
 }
 
 export async function collectDay(state, options, day, {
-  now = Date.now(), fetcher = fetch, signal, contexts = null, claudeSessions = null, seen = null, budget = 20,
-  limit = Infinity,
+  now = Date.now(), fetcher = fetch, signal, contexts = null, claudeSessions = null,
+  codexSessions = null, seen = null, budget = 20, limit = Infinity,
 } = {}) {
   const enabledAt = state.get("enabledAt");
   if (enabledAt === null) return { items: [], cursor: null, complete: true, stable: true };
@@ -178,7 +200,7 @@ export async function collectDay(state, options, day, {
   // Shared by every range read in this pass so cross-page repeats and total
   // changes invalidate the pass for the whole day.
   const pass = { total, ids: new Set(), unstable: false };
-  const context = { now, fetcher, signal, contexts, claudeSessions, seen, budget, total, pass, limit };
+  const context = { now, fetcher, signal, contexts, claudeSessions, codexSessions, seen, budget, total, pass, limit };
 
   let result;
   if (!cursor) {

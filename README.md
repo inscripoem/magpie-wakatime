@@ -32,6 +32,11 @@ key 由 Magpie 存到配置目录下的 `plugin-auth.json`，插件只读取这�
 - `project`：默认 `Magpie`。无法识别真实项目时使用的归档名。
 - `projectByAgent`：按 agent id 强制覆盖项目标签，优先于自动识别，例如 `{"codex":"Work"}`。
 - `excludeAgents`：排除某些 agent，用于避开已由其他 WakaTime 集成采集的部分。
+- `sessionFallback`：默认 `true`。设为 `false` 时插件完全不读取本机会话文件：扫描阶段的 Claude/Codex 补充和请求钩子里的 Codex `FileChange` 读取都会关闭；请求钩子仍会用 `cwd` 做只读 Git 语言推断。
+- `claudeProjectsRoot`：可选的 Claude Code 会话目录，默认 `$CLAUDE_CONFIG_DIR/projects`，未设置 `$CLAUDE_CONFIG_DIR` 时为 `~/.claude/projects`。
+- `codexHome`：可选的 Codex 主目录，默认 `$CODEX_HOME`，未设置时为 `~/.codex`。
+
+`claudeProjectsRoot` 与 `codexHome` 必须是绝对路径；目录不存在时回退结果为空，不会扫描其他位置或整个文件系统。
 
 写入密钥按顺序取：登录时填写的 key、`apiKeyEnv` 指定的环境变量、`WAKATIME_HOME`（默认用户目录）下 `.wakatime.cfg` 的 `[settings] api_key`。插件只读这些来源，不修改它们。缺少密钥时只记录状态，不开始采集，也不确定首次启用时间。
 
@@ -45,20 +50,20 @@ key 由 Magpie 存到配置目录下的 `plugin-auth.json`，插件只读取这�
 - `time` 用请求发生时间。`project` 优先使用 `projectByAgent`，其次使用请求工作目录对应的 Git 仓库名，非 Git 目录使用目录名，最后回退到 `project`。Git worktree 使用原仓库名；`branch` 是请求发生时的分支名，无法识别或处于 detached HEAD 时省略。
 - `language` 先看本次回复里工具调用（`tool_use` / `tool_calls`）实际编辑或读取的文件扩展名：写/编辑工具优先，读工具只在 Git 推断不出语言时补位；没有再回退到请求工作目录下 Git 跟踪文件的扩展名，取文件数最多的编程语言（例如 `TypeScript`）。同目录的 Git 推断结果在插件宿主进程内缓存；都无法推断时省略该字段，WakaTime 会把它归入 `Other`。
 - 扩展名映射优先使用 WakaTime 的 `program_languages`；插件内置一份快照，启动后每 24 小时刷新，失败 1 小时重试。`Diff` 默认排除，补丁文件不参与语言归因。
-- 对 Codex，还会读取 `~/.codex/sessions/**/rollout-*.jsonl` 中 `item_completed` 的 `FileChange` 事件：`changes` 的键（逗号分隔的绝对路径）和 `stdout` 的 `A/M/D` 行。只解析这一种事件行，跳过 message、reasoning 和提示词；按 `ctx.session` 的 UUID 匹配会话文件。新的 `FileChange` 更新语言；新的 `FileChange` 识别不出时置空，不沿用旧语言；没有新 `FileChange` 的请求沿用最后一次文件结果。
-- 对 Claude Code，当请求钩子没有 `cwd`、内存上下文与 `contexts.log` 都未命中时，扫描会按用量行的会话 ID 读取 `$CLAUDE_CONFIG_DIR/projects`（默认 `~/.claude/projects`）下的 `<会话ID>.jsonl`。只取顶层 `cwd`、`gitBranch` 和 `tool_use` 参数里的 `file_path`/`notebook_path`，推导项目（`cwd` 的目录名）、分支和出现最多的语言。只读文件开头 64 KB（最多 50 行）和末尾 1 MB（最多 500 行）；单个文件超过 256 MB、缺失、损坏或不是 Claude 会话时直接忽略。结果按会话缓存 10 分钟，缓存最多 128 个会话；未命中只缓存 5 秒，以便刚启动的会话尽快补上。`OpenAI` agent 不携带会话 ID，仍使用 `Magpie` 并省略语言。
+- 对 Codex，还会读取 `$CODEX_HOME`（默认 `~/.codex`）下 `sessions/YYYY/MM/DD/*<会话ID>*.jsonl`：请求钩子读取 `item_completed` 的 `FileChange` 事件，只取 `changes` 的键（逗号分隔的绝对路径）和 `stdout` 的 `A/M/D` 行，跳过 message、reasoning 和提示词。扫描阶段在请求钩子没有 `cwd`、内存上下文与 `contexts.log` 都未命中时，按用量行的会话 ID 读取同一文件的 `session_meta`：若元数据带 `cwd`，项目取该目录名、语言复用下面的只读 Git 检测；若没有 `cwd`，保留 `FileChange` 的路径语言。新的 `FileChange` 更新语言；新的 `FileChange` 识别不出时置空，不沿用旧语言；没有新 `FileChange` 的请求沿用最后一次文件结果。
+- 对 Claude Code，当请求钩子没有 `cwd`、内存上下文与 `contexts.log` 都未命中时，扫描会按用量行的会话 ID 读取 `$CLAUDE_CONFIG_DIR/projects`（默认 `~/.claude/projects`）下的 `<会话ID>.jsonl`。只读取顶层 `cwd`、`gitBranch` 和 `sessionId`，据此推导项目（`cwd` 的目录名）与分支；语言不在会话文件里推断，而是对恢复出的 `cwd` 复用只读 Git 检测（`git ls-files -z` 后交给 `detectLanguage`）。`cwd` 不存在或不是 Git 仓库时省略语言。只读文件开头和末尾各最多 64 KB、各最多 20 行；单个文件超过 256 MB、缺失、损坏或不是 Claude 会话时直接忽略。结果按会话缓存 10 分钟（最多 128 个），未命中只缓存 5 秒，以便刚启动的会话尽快补上。`OpenAI` agent 不携带会话 ID，仍使用 `Magpie` 并省略语言。
 - `ai_input_tokens` = `in + cache_write`（未命中缓存的输入加缓存写入），`ai_cached_input_tokens` = `cache_read`（为 0 时省略），`ai_output_tokens` = `out`。WakaTime 按未命中缓存的输入、缓存输入、输出三项分别计价，所以缓存读取单独上报。`reasoning` 是 `out` 的内部拆分，不重复相加。
 - `ai_session` 是本机随机盐加 agent/session 的 HMAC 摘要，同一会话稳定、跨机器不可还原。
 - `user_agent` 携带模型名称、版本和 `effort` 推理强度，优先使用实际响应模型 `served`，缺失时使用 `model`。格式沿用 [WakaTime CLI](https://github.com/wakatime/wakatime-cli/blob/develop/pkg/ai/ai.go)，例如 `gpt/5.4-high`；无法解析版本时只发送通用标识。同一批次的模型信息逐条保留，WakaTime 是否识别及如何展示取决于其服务端支持。
 - 请求头 `X-Machine-Name` 携带经过 URL 编码的本机主机名，`Timezone` 携带系统 IANA 时区。User-Agent 同时包含系统名、内核版本和架构，Windows 使用 WakaTime CLI 的 `windows` 标识。
 
-项目识别使用 [Magpie 异步请求钩子](https://usemagpie.ai/docs/plugins#asynchronous-gateway-hooks)提供的 `cwd`，通过客户端响应 `response_id` 精确关联用量，只处理宿主标记为 `local` 的请求。旧版宿主、缺少工作目录、通过命名网关密钥转发的请求，或未收到完成通知时，使用配置的项目标签并省略分支和语言。已有历史记录不会按当前工作目录、分支或语言补填。Git 命令只读且有超时；Git 不可用时使用工作目录名。语言推断先看本次回复里工具调用指向的文件路径，再回退到 Git 索引中的文件名；对 Codex 还读取其会话文件里 `FileChange` 事件行，不读取文件内容。
+项目识别使用 [Magpie 异步请求钩子](https://usemagpie.ai/docs/plugins#asynchronous-gateway-hooks)提供的 `cwd`，通过客户端响应 `response_id` 精确关联用量，只处理宿主标记为 `local` 的请求。旧版宿主、缺少工作目录、通过命名网关密钥转发的请求，或未收到完成通知时，先尝试从本机 Claude/Codex 会话元数据恢复 `cwd` 或语言，仍无法识别时使用配置的项目标签并省略分支和语言。已有历史记录不会按当前工作目录、分支或语言补填。Git 命令只读且有超时；Git 不可用时使用工作目录名。语言推断先看本次回复里工具调用指向的文件路径，再回退到 Git 索引中的文件名；对 Codex 还读取其会话文件里 `FileChange` 事件行，不读取文件内容。`sessionFallback=false` 会关闭所有本机会话文件读取。
 
 这些是后台 AI 请求的活动时间点，只能说明当时有请求，不能证明你在键盘前；时长由 WakaTime 按自己的规则计算。
 
 ## 不会发送什么
 
-账号名、邮箱、密钥、提示词、对话正文、工具结果、完整文件路径、供应商配置名、上游地址、费用和错误正文都不会离开本机。项目名、分支名、语言名、机器名、系统信息、时区和 agent 名会发送给 WakaTime。本机状态保存归一化统计、摘要、扫描游标、待发送 heartbeat 的持久队列（完整映射后的 payload，含项目/分支/语言、token 数与加盐会话摘要；已确认记录保留为 ID 墓碑用于去重）和项目/分支/语言快照；为在重启后把重放的用量行重新匹配到请求上下文，`contexts.log` 还会在本机保存原始响应 ID 与会话 ID，这些条目 10 分钟后过期，并按大小或行数压缩。原始 ID 不上传，网络 payload 里的 `ai_session` 仍是加盐 HMAC；工作目录、提示词和对话内容不保存。语言识别只在内存中解析工具调用参数里的文件路径和扩展名，跳过文件正文与 shell 命令，不写日志、不入库、不上传。Codex 会话文件只读取 `FileChange` 事件行；不保存、不上传路径或 stdout。Claude Code 会话文件只解析顶层元数据和工具调用参数中的文件路径，内存与缓存中只保留项目名、分支名和语言名；提示词、回复、工具结果、文件正文和路径都不写入日志或状态，也不上传。刷新语言表只向 WakaTime 发送 API key，不发送文件路径或内容。
+账号名、邮箱、密钥、提示词、对话正文、工具结果、完整文件路径、供应商配置名、上游地址、费用和错误正文都不会离开本机。项目名、分支名、语言名、机器名、系统信息、时区和 agent 名会发送给 WakaTime。本机状态保存归一化统计、摘要、扫描游标、待发送 heartbeat 的持久队列（完整映射后的 payload，含项目/分支/语言、token 数与加盐会话摘要；已确认记录保留为 ID 墓碑用于去重）和项目/分支/语言快照；为在重启后把重放的用量行重新匹配到请求上下文，`contexts.log` 还会在本机保存原始响应 ID 与会话 ID，这些条目 10 分钟后过期，并按大小或行数压缩。原始 ID 不上传，网络 payload 里的 `ai_session` 仍是加盐 HMAC；工作目录、提示词和对话内容不保存。语言识别只在内存中解析工具调用参数里的文件路径和扩展名，跳过文件正文与 shell 命令，不写日志、不入库、不上传。Codex 会话文件只读取 `session_meta` 的 `cwd` 和 `FileChange` 事件行；不保存、不上传路径或 stdout。Claude Code 会话文件只读取顶层 `cwd`、`gitBranch`、`sessionId`，不解析 message/tool_use，不读取文件正文；内存与缓存中只保留项目名、分支名和语言名。提示词、回复、工具结果、文件正文和路径都不写入日志或状态，也不上传。`sessionFallback=false` 时不会打开任何本机会话文件。刷新语言表只向 WakaTime 发送 API key，不发送文件路径或内容。
 
 ## 与现有 WakaTime 采集的重复
 

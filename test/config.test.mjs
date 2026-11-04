@@ -14,6 +14,22 @@ test("accepts only loopback gateway origins", () => {
   expect(() => readOptions({ excludeAgents: "codex" })).toThrow("invalid-config");
 });
 
+test("validates the session fallback and its optional roots", () => {
+  expect(readOptions({}).sessionFallback).toBe(true);
+  expect(readOptions({}).claudeProjectsRoot).toBeNull();
+  expect(readOptions({}).codexHome).toBeNull();
+  expect(readOptions({ sessionFallback: false }).sessionFallback).toBe(false);
+  expect(readOptions({ claudeProjectsRoot: "/tmp/claude-projects", codexHome: "/tmp/codex" }))
+    .toMatchObject({ claudeProjectsRoot: "/tmp/claude-projects", codexHome: "/tmp/codex" });
+  for (const sessionFallback of ["yes", 1]) {
+    expect(() => readOptions({ sessionFallback })).toThrow("invalid-config");
+  }
+  for (const root of ["relative/path", "", ".", "/tmp/has\0nul", 42, "x".repeat(4097)]) {
+    expect(() => readOptions({ claudeProjectsRoot: root })).toThrow("invalid-config");
+    expect(() => readOptions({ codexHome: root })).toThrow("invalid-config");
+  }
+});
+
 test("reads only the selected key source without modifying the standard config", () => {
   const dir = tempDirectory();
   try {

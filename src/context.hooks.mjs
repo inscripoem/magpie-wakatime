@@ -69,9 +69,11 @@ export async function onRequest(_body, ctx) {
     if (language) ctx.state.wakatime.language = language;
     // Codex records the files it changed after the tool runs. Its session file
     // names the same UUID the gateway reports as ctx.session, so a finished
-    // apply_patch becomes the language of the following requests.
-    if (ctx.agent === "codex" && typeof ctx.session === "string") {
-      const fromSession = codexSessions.language(ctx.session);
+    // apply_patch becomes the language of the following requests. The global
+    // opt-out disables this session-file read; the Git detection above stays.
+    if (current.options.sessionFallback !== false &&
+        ctx.agent === "codex" && typeof ctx.session === "string") {
+      const fromSession = (current.codexSessions ?? codexSessions).language(ctx.session);
       if (fromSession) ctx.state.wakatime.language = fromSession;
     }
     current.countHook?.("ok");

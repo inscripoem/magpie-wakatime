@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 export function readOptions(options = {}) {
   const invalid = () => { throw new Error("invalid-config"); };
@@ -15,13 +15,19 @@ export function readOptions(options = {}) {
     authAccount: options.authAccount ?? null,
     project: options.project ?? "Magpie", projectByAgent: options.projectByAgent ?? {},
     excludeAgents: options.excludeAgents ?? [],
+    sessionFallback: options.sessionFallback ?? true,
+    claudeProjectsRoot: options.claudeProjectsRoot ?? null,
+    codexHome: options.codexHome ?? null,
   };
   const label = (v) => typeof v === "string" && v.trim().length > 0 && v.length <= 255;
+  const root = (v) => v === null ||
+    (typeof v === "string" && v.length > 0 && v.length <= 4096 && isAbsolute(v) && !v.includes("\0"));
   if (!label(result.project) || !/^[a-z_][a-z0-9_]*$/i.test(result.apiKeyEnv) ||
       (result.authAccount !== null && (!label(result.authAccount) || !/^wakatime(?:#[^\s#]+)?$/.test(result.authAccount))) ||
       !result.projectByAgent || typeof result.projectByAgent !== "object" || Array.isArray(result.projectByAgent) ||
       !Object.entries(result.projectByAgent).every(([k, v]) => label(k) && label(v)) ||
-      !Array.isArray(result.excludeAgents) || !result.excludeAgents.every(label)) invalid();
+      !Array.isArray(result.excludeAgents) || !result.excludeAgents.every(label) ||
+      typeof result.sessionFallback !== "boolean" || !root(result.claudeProjectsRoot) || !root(result.codexHome)) invalid();
   return result;
 }
 

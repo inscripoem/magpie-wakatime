@@ -9,6 +9,7 @@ import { Queue, QueueFullError, QUEUE_CAPACITY, ACK_RETENTION_MS, queueStatus } 
 import { BATCH_ROWS, EnqueueBuffer, AckGate } from "./batching.mjs";
 import { collectDay, localDay } from "./source.mjs";
 import { ClaudeSessions } from "./claude-session.mjs";
+import { CodexSessions } from "./codex-session.mjs";
 import { readApiKey, defaultDirectory } from "./config.mjs";
 import { defaultUserAgent } from "./user-agent.mjs";
 
@@ -111,7 +112,7 @@ function permanent(code) {
 export class Sync {
   constructor(directory, options, {
     env = process.env, enabled = () => true, fetcher = fetch, sourceFetcher = fetch, now = Date.now(),
-    queueCapacity = QUEUE_CAPACITY, claudeSessions = null,
+    queueCapacity = QUEUE_CAPACITY, claudeSessions = null, codexSessions = null,
   } = {}) {
     const stateDirectory = join(directory, "magpie-wakatime");
     mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
@@ -119,7 +120,14 @@ export class Sync {
     this.contexts = new Contexts({
       ttl: CONTEXT_TTL_MS, journal: join(stateDirectory, "contexts.log"), now,
     });
-    this.claudeSessions = claudeSessions ?? new ClaudeSessions({ env });
+    this.claudeSessions = claudeSessions ?? new ClaudeSessions({
+      root: options.claudeProjectsRoot ?? null, env,
+    });
+    // The hook keeps its own reader. Both only read the transcript, and each
+    // keeps its own byte offset, so a scan and a hook cannot corrupt progress.
+    this.codexSessions = codexSessions ?? new CodexSessions({
+      home: options.codexHome ?? null, env,
+    });
     this.queue = new Queue(join(stateDirectory, "queue.sqlite"), { capacity: queueCapacity });
     // A's buffer and staged commits are reused unchanged: mapped rows wait
     // here until 25 rows or one window, and no cursor moves past them.
@@ -195,9 +203,13 @@ export class Sync {
   // can never exceed the flush threshold and the crash duplicate bound stays
   // at one flush. The source returns the cursor for exactly that prefix.
   collectOptions(now, limit = BATCH_ROWS) {
+    // The opt-out guarantees that a scan performs no local session-file reads.
+    const fallback = this.options.sessionFallback !== false;
     return {
       now, signal: this.abort.signal, fetcher: this.sourceFetcher,
-      contexts: this.contexts, claudeSessions: this.claudeSessions,
+      contexts: this.contexts,
+      claudeSessions: fallback ? this.claudeSessions : null,
+      codexSessions: fallback ? this.codexSessions : null,
       seen: this.seen, budget: 20, limit,
     };
   }
