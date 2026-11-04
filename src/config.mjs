@@ -15,6 +15,7 @@ export function readOptions(options = {}) {
     authAccount: options.authAccount ?? null,
     project: options.project ?? "Magpie", projectByAgent: options.projectByAgent ?? {},
     excludeAgents: options.excludeAgents ?? [],
+    excludeCallerKeys: options.excludeCallerKeys ?? [],
     sessionFallback: options.sessionFallback ?? true,
     claudeProjectsRoot: options.claudeProjectsRoot ?? null,
     codexHome: options.codexHome ?? null,
@@ -27,6 +28,7 @@ export function readOptions(options = {}) {
       !result.projectByAgent || typeof result.projectByAgent !== "object" || Array.isArray(result.projectByAgent) ||
       !Object.entries(result.projectByAgent).every(([k, v]) => label(k) && label(v)) ||
       !Array.isArray(result.excludeAgents) || !result.excludeAgents.every(label) ||
+      !Array.isArray(result.excludeCallerKeys) || !result.excludeCallerKeys.every(label) ||
       typeof result.sessionFallback !== "boolean" || !root(result.claudeProjectsRoot) || !root(result.codexHome)) invalid();
   return result;
 }

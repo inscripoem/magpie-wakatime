@@ -105,10 +105,11 @@ Magpie 会为不同 CLI 调用和应用创建不同宿主，更新时旧宿主�
 | `project` | `Magpie`；缺少真实项目信息时的固定归档标签 |
 | `projectByAgent` | 空映射；按 agent id 覆盖项目标签 |
 | `excludeAgents` | 空数组；排除已由其他 WakaTime 集成采集的 agent |
+| `excludeCallerKeys` | 空数组；按网关调用方 key 名称排除远端请求，保留本机无 key 的同名 agent |
 
 密钥解析优先使用 `apiKeyEnv` 指定的环境变量；未设置时，只读取 WakaTime 标准配置文件 `[settings].api_key`。按 `WAKATIME_HOME` 或用户目录定位配置，不读取和打印整份配置，不修改原有 WakaTime 配置。缺少密钥时显示明确状态，暂不开始采集；配置完成后才确定首次启用时间。
 
-插件状态保存在传入 directory 下的 `magpie-wakatime/`：`state.json` 保存逐日扫描游标并冗余 `salt/gateway/enabledAt`，`identity.json` 保存 salt、网关与首次启用时间，`contexts.log` 追加保存项目/分支/语言以及匹配用的原始响应 ID 与会话 ID（仅本机、10 分钟 TTL、按阈值压缩、不上传），`queue.sqlite` 保存待发送 heartbeat 的完整映射 payload 与已确认 ID 墓碑，`owner.lock/` 保存单实例上传锁。只保存归一化统计、不可逆身份摘要、扫描状态、待发送数据及本机上下文匹配所需的最小标识，不保存 API key、工作目录、账号名、提示词或对话正文。网络 payload 的 `ai_session` 仍是加盐 HMAC。
+插件状态保存在传入 directory 下的 `magpie-wakatime/`：`state.json` 保存逐日扫描游标并冗余 `salt/gateway/enabledAt`，`identity.json` 保存 salt、网关与首次启用时间，`contexts.log` 追加保存项目/分支/语言以及匹配用的原始响应 ID 与会话 ID（仅本机、10 分钟 TTL、按阈值压缩、不上传），`sent.log` 保存已发送或已入队行的加盐 `route_id` 摘要（仅本机、3 天、按天或大小压缩、不上传），`queue.sqlite` 保存待发送 heartbeat 的完整映射 payload 与已确认 ID 墓碑，`owner.lock/` 保存单实例上传锁。只保存归一化统计、不可逆身份摘要、扫描状态、待发送数据及本机上下文匹配所需的最小标识，不保存 API key、工作目录、账号名、提示词或对话正文。网络 payload 的 `ai_session` 仍是加盐 HMAC。
 
 - 每批最多 25 条；到期批次连续发送，遇 429/5xx 按退避等待。单请求超时 10 秒；网络错误、429、5xx 采用带抖动的指数退避，范围 5 秒至 5 分钟，并尊重有效的 Retry-After。
 - 批量响应逐项处理；只有对应条目成功才标记已发送。HTTP 请求成功不等于整批成功。

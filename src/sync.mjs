@@ -7,7 +7,8 @@ import { State } from "./state.mjs";
 import { Contexts, CONTEXT_TTL_MS } from "./contexts.mjs";
 import { Queue, QueueFullError, QUEUE_CAPACITY, ACK_RETENTION_MS, queueStatus } from "./queue.mjs";
 import { BATCH_ROWS, EnqueueBuffer, AckGate } from "./batching.mjs";
-import { collectDay, localDay } from "./source.mjs";
+import { collectDay, localDay, seedKeys } from "./source.mjs";
+import { SentLog } from "./sent-log.mjs";
 import { ClaudeSessions } from "./claude-session.mjs";
 import { CodexSessions } from "./codex-session.mjs";
 import { readApiKey, defaultDirectory } from "./config.mjs";
@@ -133,6 +134,14 @@ export class Sync {
       home: options.codexHome ?? null, env,
     });
     this.queue = new Queue(join(stateDirectory, "queue.sqlite"), { capacity: queueCapacity });
+    // A local, salted memory of delivered route ids. The cursor records where
+    // the scan is; this log makes a re-read after a reset or restart skip rows
+    // that already reached WakaTime. It is best-effort: a lost tail only
+    // replays a batch, never skips one.
+    this.sent = new SentLog(join(stateDirectory, "sent.log"), { now });
+    this.sent.remember(this.queue.pendingKeys());
+    this.sentReady = false;
+    this.sentFailures = 0;
     // A's buffer and staged commits are reused unchanged: mapped rows wait
     // here until 25 rows or one window, and no cursor moves past them.
     this.buffer = new EnqueueBuffer();
@@ -241,6 +250,7 @@ export class Sync {
       lookup: this.contexts.stats(),
       mapped: this.mappedSnapshot(),
     });
+    this.state.setDiagnostic("sentLog", { keys: this.sent.size, ready: this.sentReady });
   }
 
   // Each call maps at most the free room in the 25-row buffer, so the buffer
@@ -255,7 +265,7 @@ export class Sync {
       claudeSessions: fallback ? this.claudeSessions : null,
       codexSessions: fallback ? this.codexSessions : null,
       onMapped: (agent, hasLanguage) => this.countMapped(agent, hasLanguage),
-      seen: this.seen, budget: 20, limit,
+      seen: this.seen, sent: this.sent, budget: 20, limit,
     };
   }
 
@@ -267,12 +277,31 @@ export class Sync {
     if (!items.length) return true;
     try {
       this.queue.enqueue(items, now);
+      // The rows are durable in the queue, so a re-read must not scan them
+      // again even if the cursor later resets. No file append is needed:
+      // pendingKeys() restores the same keys after a restart.
+      this.sent.remember(items.map((item) => item.key));
       this.state.setDiagnostic("queueError", null);
       return true;
     } catch (error) {
       this.state.setDiagnostic("queueError",
         error instanceof QueueFullError ? "queue-full" : "enqueue-failed");
       this.state.setDiagnostic("runtime", "backlog");
+      return false;
+    }
+  }
+
+  // Best-effort durable replay memory for rows WakaTime accepted or permanently
+  // rejected. A failed append does not block the send or the cursor: the row
+  // is already delivered, and the only cost is a possible replay after a
+  // restart.
+  recordSent(items, now) {
+    try {
+      this.sent.add(items.map((item) => item.key), now);
+      this.state.setDiagnostic("sentLogError", null);
+      return true;
+    } catch {
+      this.state.setDiagnostic("sentLogError", "append-failed");
       return false;
     }
   }
@@ -325,6 +354,7 @@ export class Sync {
       }
       this.stats.sent += sent.length;
       this.stats.rejected += rejected.length;
+      if (sent.length || rejected.length) this.recordSent([...sent, ...rejected], now);
       if (deferred.length) {
         // Stop direct sending at the first transient failure. Only the
         // unacknowledged rows of this buffer become durable, in one
@@ -359,6 +389,46 @@ export class Sync {
     for (let index = 0; index < accepted.length; index++) this.seen.add(accepted[index].id, now);
     if (!this.buffer.ready(now)) return { accepted: accepted.length, status: "idle" };
     return { accepted: accepted.length, status: await this.flushBuffer(now, key) };
+  }
+
+  // Before the first scan of a fresh sent log, copy the keys of every cursor's
+  // committed prefix into it. Without this a reset or a restart between the
+  // old version and this one could re-send rows the cursor already covered. A
+  // prefix that no longer matches its cursor is left unseeded; the scan still
+  // runs, and a replay is bounded to rows this process has not recorded.
+  async ensureSent(now) {
+    if (this.sentReady) return true;
+    if (this.sent.loaded > 0) { this.sentReady = true; return true; }
+    let attempted = false, complete = true;
+    for (const day of Object.keys(this.state.cursors)) {
+      const cursor = this.state.cursor(day);
+      if (!cursor || cursor.offset <= 0) continue;
+      attempted = true;
+      let keys = null;
+      try {
+        keys = await seedKeys(this.state, this.options, day, cursor, {
+          fetcher: this.sourceFetcher, signal: this.abort.signal,
+        });
+      } catch { keys = null; }
+      if (keys === null) { complete = false; continue; }
+      try { this.sent.add(keys, now); }
+      catch { this.state.setDiagnostic("sentLogError", "append-failed"); complete = false; }
+    }
+    if (complete) {
+      this.sentReady = true;
+      this.state.setDiagnostic("sentSeed", attempted ? "ok" : "empty");
+      return true;
+    }
+    this.sentFailures++;
+    this.state.setDiagnostic("sentSeed", "retrying");
+    // Never stall the plugin forever on an unmatchable cursor. After three
+    // tries the scan proceeds; the cost is a possible replay, not a lost row.
+    if (this.sentFailures >= 3) {
+      this.sentReady = true;
+      this.state.setDiagnostic("sentSeed", "failed");
+      return true;
+    }
+    return false;
   }
 
   // Process one day in windows. Each collectDay call names the cursor for the
@@ -470,6 +540,8 @@ export class Sync {
         else deferred.push(entry);
       }
       if (sentIds.length || rejectedIds.length) this.queue.ack([...sentIds, ...rejectedIds], now);
+      const handled = entries.filter((entry) => sentIds.includes(entry.id) || rejectedIds.includes(entry.id));
+      if (handled.length) this.recordSent(handled, now);
       this.stats.sent += sentIds.length;
       this.stats.rejected += rejectedIds.length;
       if (deferred.length) {
@@ -529,12 +601,18 @@ export class Sync {
     }
     if (this.sourceBlocked) return;
     if (key === this.blockedKey) { this.persistContextStats(); this.state.flush(now); return; }
+    if (!(await this.ensureSent(now))) {
+      this.persistContextStats();
+      this.state.flush(now, true);
+      return;
+    }
 
     this.contexts.maintain(now);
     this.seen.prune(now);
     if (now >= this.nextPrune) {
       this.nextPrune = now + PRUNE_MS;
       this.state.pruneCursors(localDay(now, -3));
+      this.sent.prune(now);
       // While an old backfill day is still unscanned, a cursor reset can
       // re-read it. Keep its acknowledgement tombstones even past the normal
       // retention so those rows cannot be re-sent.
@@ -631,6 +709,7 @@ export class Sync {
       contextStats: { hook: this.hookSnapshot(), lookup: this.contexts.stats(), mapped: this.mappedSnapshot() },
       contexts: this.contexts.size(),
       seen: this.seen.size,
+      sent: this.sent.size,
       queue: this.queue.status(),
     };
   }

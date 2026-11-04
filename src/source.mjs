@@ -1,4 +1,4 @@
-import { mapRow, sourceId } from "./map.mjs";
+import { mapRow, sourceId, sourceKey } from "./map.mjs";
 
 export function localDay(value = Date.now(), offset = 0) {
   const date = new Date(value);
@@ -78,7 +78,7 @@ function mergeContext(explicit, derived) {
 
 async function readRange(state, options, day, start, end, {
   now, fetcher, signal, contexts, claudeSessions, codexSessions, onMapped,
-  seen, budget, pass, limit = Infinity,
+  seen, sent, budget, pass, limit = Infinity,
 }) {
   const salt = state.get("salt");
   const enabledAt = state.get("enabledAt");
@@ -103,6 +103,11 @@ async function readRange(state, options, day, start, end, {
       // Rows already known from an earlier pass are not newly processed here;
       // tracking them would mark every later pass unstable forever.
       if (seen?.has(id)) continue;
+      // A row already delivered (or durably queued) must survive a cursor
+      // reset or process restart without a second heartbeat. The key is based
+      // on the gateway's stable route id, not the mutable row source id.
+      const key = sourceKey(row ?? {}, salt);
+      if (sent?.has(key)) { seen?.add(id, now); continue; }
       // A row repeated across pages means the listing shifted under the scan.
       // The set is per pass; the global seen set cannot detect this because a
       // repeat can still be new to this pass.
@@ -130,7 +135,7 @@ async function readRange(state, options, day, start, end, {
       // mapped heartbeat or the cursor.
       try { onMapped?.(row.agent, payload.language !== undefined); }
       catch { /* diagnostics are best-effort */ }
-      items.push({ id, payload });
+      items.push({ id, payload, key });
       if (items.length >= limit) { full = true; break; }
     }
     offset = pageStart + consumed;
@@ -193,7 +198,7 @@ async function stableHead(options, day, head, total, salt, { fetcher, signal }) 
 
 export async function collectDay(state, options, day, {
   now = Date.now(), fetcher = fetch, signal, contexts = null, claudeSessions = null,
-  codexSessions = null, onMapped = null, seen = null, budget = 20, limit = Infinity,
+  codexSessions = null, onMapped = null, seen = null, sent = null, budget = 20, limit = Infinity,
 } = {}) {
   const enabledAt = state.get("enabledAt");
   if (enabledAt === null) return { items: [], cursor: null, complete: true, stable: true };
@@ -206,7 +211,7 @@ export async function collectDay(state, options, day, {
   // changes invalidate the pass for the whole day.
   const pass = { total, ids: new Set(), unstable: false };
   const context = { now, fetcher, signal, contexts, claudeSessions, codexSessions, onMapped,
-    seen, budget, total, pass, limit };
+    seen, sent, budget, total, pass, limit };
 
   let result;
   if (!cursor) {
@@ -316,4 +321,37 @@ export async function collectDay(state, options, day, {
     return { ...result, cursor, complete: false, stable: false };
   }
   return result;
+}
+
+// Rebuild the keys of the committed prefix after a restart. The cursor names
+// its first and last row; the listing may have grown at the front since, so
+// rows above the old head are new and must not be marked sent. Scanning by id
+// tolerates page overlaps caused by those insertions. A prefix whose
+// boundaries moved, or whose length no longer matches the cursor, is not
+// seeded: a replay is safer than skipping an undelivered row.
+export async function seedKeys(state, options, day, cursor, {
+  fetcher = fetch, signal, budget = 60,
+} = {}) {
+  if (!cursor || cursor.offset <= 0 || !cursor.head || !cursor.tail) return null;
+  const salt = state.get("salt");
+  const seen = new Set(), keys = [];
+  let foundHead = false, offset = 0, pages = 0;
+  while (pages < budget) {
+    const body = await sourcePage(options, day, offset, { fetcher, signal });
+    if (!body.rows.length) break;
+    for (const row of body.rows) {
+      const id = cursorId(sourceId(row ?? {}, salt));
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (!foundHead) {
+        if (id !== cursor.head) continue;
+        foundHead = true;
+      }
+      keys.push(sourceKey(row ?? {}, salt));
+      if (id === cursor.tail) return keys.length === cursor.offset ? keys : null;
+    }
+    offset += body.rows.length;
+    pages++;
+  }
+  return null;
 }

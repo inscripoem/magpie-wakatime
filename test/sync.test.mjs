@@ -899,7 +899,7 @@ test("a later window's failure enqueues only that window's rows", async () => {
   } finally { cleanup(directory, worker); }
 });
 
-test("a crash after a 2xx but before the cursor flush replays at most the buffer", async () => {
+test("a crash after a 2xx but before the cursor flush replays nothing", async () => {
   const rows = [row(3, { response_id: "resp-3" }), row(2, { response_id: "resp-2" }),
     row(1, { response_id: "resp-1" })];
   const first = setup(rows);
@@ -932,8 +932,9 @@ test("a crash after a 2xx but before the cursor flush replays at most the buffer
     expect(healthy.calls).toHaveLength(0);
     await restarted.tick(now + 150_000);
     const replay = healthy.calls.flat();
-    expect(replay).toEqual(original);
-    expect(replay.every((payload) => payload.project === "repo")).toBe(true);
+    // The three rows reached WakaTime before the crash, and the sent log
+    // remembers their route ids even though state.json never moved.
+    expect(replay).toHaveLength(0);
     expect(restarted.queue.status()).toMatchObject({ pending: 0, acked: 0 });
     expect(restarted.state.cursor(day).offset).toBe(3);
   } finally {
@@ -964,7 +965,7 @@ test("a 1,500-row result is processed in 25-row windows", async () => {
   } finally { cleanup(directory, worker); }
 }, 30_000);
 
-test("a crash after one window's 2xx re-sends at most 25 rows, not the result", async () => {
+test("a crash after one window's 2xx re-sends none of the 25 rows", async () => {
   const rows = Array.from({ length: 1_500 }, (_, index) => row(index + 1));
   let crashing;
   const fetcher = waka((count, body) => {
@@ -998,10 +999,10 @@ test("a crash after one window's 2xx re-sends at most 25 rows, not the result", 
     await restarted.tick(now + 1000);
     await restarted.tick(now + 31_000);
     const replay = healthy.calls.flat();
-    expect(replay).toHaveLength(1_500);
+    expect(replay).toHaveLength(1_475);
     const before = new Set(sent.map((payload) => payload.time));
     const duplicates = replay.filter((payload) => before.has(payload.time));
-    expect(duplicates.length).toBe(25);
+    expect(duplicates.length).toBe(0);
     expect(restarted.state.cursor(day).offset).toBe(1_500);
   } finally {
     if (restarted) { restarted.state.release(restarted.owner); restarted.stopped = true; restarted.close(); }
@@ -1056,15 +1057,17 @@ test("a head-insertion crash holds the old cursor and never re-sends the old pre
     // The front completes and the merged cursor names both parts.
     expect(third.state.cursor(day).offset).toBe(200);
     const replay = healthy.calls.flat();
-    expect(replay).toHaveLength(100);
-    const replayTimes = new Set(replay.map((payload) => payload.time));
-    expect([...oldTimes].some((time) => replayTimes.has(time))).toBe(false);
-    for (const value of frontRows) {
-      expect(replayTimes.has(Date.parse(value.t) / 1000)).toBe(true);
+    // The three front windows that reached WakaTime before the crash are in
+    // the sent log; only the fourth, buffered window is sent again.
+    expect(replay).toHaveLength(25);
+    const delivered = new Map();
+    for (const payload of [...crasher.calls.slice(0, 3).flat(), ...replay]) {
+      delivered.set(payload.time, (delivered.get(payload.time) ?? 0) + 1);
     }
-    // Only the three already-sent front windows are duplicates.
-    const sentFront = new Set(crasher.calls.slice(0, 3).flat().map((payload) => payload.time));
-    expect(replay.filter((payload) => sentFront.has(payload.time))).toHaveLength(75);
+    for (const value of frontRows) {
+      expect(delivered.get(Date.parse(value.t) / 1000)).toBe(1);
+    }
+    expect([...oldTimes].some((time) => delivered.has(time))).toBe(false);
 
     // Tail windows advance normally after the merged cursor lands.
     rows.push(row(2000));
@@ -1085,7 +1088,7 @@ test("a head-insertion crash holds the old cursor and never re-sends the old pre
   }
 }, 30_000);
 
-test("a one-row head insertion crash re-sends only that row", async () => {
+test("a one-row head insertion crash is not re-sent", async () => {
   const rows = Array.from({ length: 50 }, (_, index) => row(index + 1));
   const first = setup(rows);
   let second, third;
@@ -1125,12 +1128,10 @@ test("a one-row head insertion crash re-sends only that row", async () => {
       sourceFetcher: gateway(rows), now: now + 62_000,
     });
     await third.tick(now + 62_000);
-    expect(third.buffer.length).toBe(1);
+    expect(third.buffer.length).toBe(0);
     await third.tick(now + 122_000);
     const again = replay.calls.flat();
-    expect(again).toHaveLength(1);
-    expect(again[0].time).toBe(Date.parse(front.t) / 1000);
-    expect([...oldTimes].some((time) => again.some((payload) => payload.time === time))).toBe(false);
+    expect(again).toHaveLength(0);
     expect(third.state.cursor(day).offset).toBe(51);
   } finally {
     for (const worker of [first.worker, second, third]) {
@@ -1182,7 +1183,11 @@ test("recovers a middle insertion behind a committed cursor", async () => {
       delivered.set(payload.time, (delivered.get(payload.time) ?? 0) + 1);
     }
     for (const value of rows) {
-      expect(delivered.get(Date.parse(value.t) / 1000)).toBe(1);
+      // Rows 1..500 formed the seeded committed prefix. The replay must skip
+      // them, while the middle insertion (10,600) and 501..600 are delivered
+      // exactly once.
+      const expected = Number(value.route_id) <= 500 ? 0 : 1;
+      expect(delivered.get(Date.parse(value.t) / 1000) ?? 0).toBe(expected);
     }
     expect(worker.queue.status().pending).toBe(0);
   } finally { cleanup(directory, worker); }

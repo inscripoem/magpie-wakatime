@@ -48,18 +48,25 @@ export class Queue {
         state TEXT NOT NULL DEFAULT 'pending',
         attempts INTEGER NOT NULL DEFAULT 0,
         due INTEGER NOT NULL DEFAULT 0,
-        at INTEGER NOT NULL
+        at INTEGER NOT NULL,
+        key TEXT
       );
       CREATE INDEX IF NOT EXISTS queue_pending ON queue(state, due);
     `);
+    // Existing databases predate the stable replay key.
+    const columns = this.db.query("SELECT name FROM pragma_table_info('queue')").all().map((row) => row.name);
+    if (!columns.includes("key")) this.db.exec("ALTER TABLE queue ADD COLUMN key TEXT");
     this.pendingCountQuery = this.db.query("SELECT count(*) AS n FROM queue WHERE state='pending'");
     this.ackedCountQuery = this.db.query("SELECT count(*) AS n FROM queue WHERE state='acked'");
     this.findQuery = this.db.query("SELECT state FROM queue WHERE id=?");
     this.insertQuery = this.db.query(
-      "INSERT INTO queue(id, payload, state, attempts, due, at) VALUES (?, ?, 'pending', 0, 0, ?)",
+      "INSERT INTO queue(id, payload, state, attempts, due, at, key) VALUES (?, ?, 'pending', 0, 0, ?, ?)",
     );
     this.pendingQuery = this.db.query(
-      "SELECT id, payload, attempts FROM queue WHERE state='pending' AND due<=? ORDER BY rowid LIMIT ?",
+      "SELECT id, payload, attempts, key FROM queue WHERE state='pending' AND due<=? ORDER BY rowid LIMIT ?",
+    );
+    this.pendingKeysQuery = this.db.query(
+      "SELECT key FROM queue WHERE state='pending' AND key IS NOT NULL",
     );
     this.dueQuery = this.db.query(
       "SELECT count(*) AS n, min(at) AS oldest FROM queue WHERE state='pending' AND due<=?",
@@ -78,10 +85,10 @@ export class Queue {
     return transaction(this.db, () => {
       let pending = this.pendingCountQuery.get().n;
       let added = 0;
-      for (const { id, payload } of items) {
+      for (const { id, payload, key } of items) {
         if (this.findQuery.get(id)) continue;
         if (pending >= this.capacity) throw new QueueFullError();
-        this.insertQuery.run(id, JSON.stringify(payload), now);
+        this.insertQuery.run(id, JSON.stringify(payload), now, key ?? id);
         pending++;
         added++;
       }
@@ -91,8 +98,12 @@ export class Queue {
 
   pending(now = Date.now(), limit = 25) {
     return this.pendingQuery.all(now, limit).map((row) => ({
-      id: row.id, payload: JSON.parse(row.payload), attempts: row.attempts,
+      id: row.id, payload: JSON.parse(row.payload), attempts: row.attempts, key: row.key,
     }));
+  }
+
+  pendingKeys() {
+    return this.pendingKeysQuery.all().map((row) => row.key);
   }
 
   pendingCount() { return this.pendingCountQuery.get().n; }

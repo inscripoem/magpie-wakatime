@@ -10,14 +10,27 @@ export function sourceId(row, salt) {
     row.host ?? "", row.model ?? "", row.rid || row.response_id || ""], salt);
 }
 
+// Durable replay key. The gateway assigns route_id once per request and keeps
+// it while finalizing the other fields, so it stays stable even when rid or the
+// served model is filled in later. The salted digest keeps the raw route id on
+// this machine. Rows without a route id fall back to the source id.
+export function sourceKey(row, salt) {
+  const route = typeof row?.route_id === "string" ? row.route_id : "";
+  return route ? digest(["route", row.agent ?? "", route], salt) : sourceId(row ?? {}, salt);
+}
+
 export function contextKey(agent, response, salt) {
   return typeof response === "string" && response ? `context:${digest([agent ?? "", response], salt)}` : null;
 }
 
 export function mapRow(row, options, salt, context) {
   if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("invalid-row");
+  const caller = typeof row.callerKeyName === "string" && row.callerKeyName
+    ? row.callerKeyName
+    : typeof row.callerKeyLabel === "string" ? row.callerKeyLabel : "";
   if (row.computer || row.rejected || (row.source && row.source !== "through") ||
-      (row.via && row.via !== "through") || options.excludeAgents.includes(row.agent)) return null;
+      (row.via && row.via !== "through") || options.excludeAgents.includes(row.agent) ||
+      (caller && options.excludeCallerKeys?.includes(caller))) return null;
   const time = typeof row.t === "string" ? Date.parse(row.t) / 1000 : NaN;
   const values = [row.in, row.out, row.cache_read ?? 0, row.cache_write ?? 0];
   if (!Number.isFinite(time) || time <= 0 || values.some((n) => !Number.isSafeInteger(n) || n < 0)) {
