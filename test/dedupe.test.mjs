@@ -35,12 +35,12 @@ function waka() {
   return fetcher;
 }
 
-function setup(rows, options = readOptions()) {
+function setup(rows, options = readOptions(), sourceFetcher = gateway(rows)) {
   const directory = tempDirectory();
   const fetcher = waka();
   const worker = new Sync(directory, options, {
     env: { WAKATIME_HOME: directory, WAKATIME_API_KEY: "test-key" },
-    fetcher, sourceFetcher: gateway(rows), now,
+    fetcher, sourceFetcher, now,
   });
   worker.state.activate(options.gatewayUrl, now - 120_000);
   worker.state.lastFlush = now;
@@ -132,6 +132,44 @@ test("a fresh sent log is seeded from a committed cursor without sending", async
     expect(sent).toHaveLength(1);
     expect(sent[0].time).toBe(Date.parse(rows[0].t) / 1000);
     expect(worker.state.cursor(day)?.offset).toBe(101);
+  } finally { cleanup(directory, worker); }
+});
+
+test("a row inserted during a pass still advances the durable cursor", async () => {
+  const rows = Array.from({ length: 25 }, (_, index) => row(index + 1));
+  let zeroReads = 0, mutated = false;
+  const sourceFetcher = async (url) => {
+    const offset = Number(new URL(url).searchParams.get("offset"));
+    const source = mutated ? rows : rows.slice();
+    const body = {
+      rows: source.slice(offset, offset + 500),
+      total: source.length,
+      offset: Math.min(offset, source.length),
+    };
+    // The head snapshot and the window read both see the original list; the
+    // new request lands before the pass's final stability check.
+    if (!mutated && offset === 0) {
+      zeroReads++;
+      if (zeroReads === 2) { mutated = true; rows.unshift(row(1000)); }
+    }
+    return Response.json(body);
+  };
+  const { directory, worker, fetcher } = setup(rows, readOptions(), sourceFetcher);
+  try {
+    await worker.tick(now);
+    // The extra front row is not in this pass, but the cursor still commits.
+    expect(worker.state.cursor(day)?.offset).toBe(25);
+    await worker.tick(now + 31_000);
+    // The next pass maps only the new front row; the buffer waits for its
+    // one-minute window before the cursor can commit.
+    expect(worker.state.cursor(day)?.offset).toBe(25);
+    await worker.tick(now + 92_000);
+    expect(worker.state.cursor(day)?.offset).toBe(26);
+    const sent = fetcher.calls.flat();
+    const times = sent.map((payload) => payload.time);
+    expect(new Set(times).size).toBe(times.length);
+    expect(times).toHaveLength(26);
+    expect(times).toContain(Date.parse(rows[0].t) / 1000);
   } finally { cleanup(directory, worker); }
 });
 

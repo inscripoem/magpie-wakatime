@@ -34,6 +34,14 @@ export function cursorId(value) {
   return typeof value === "string" ? value.slice(0, 16) : null;
 }
 
+// Cursor anchors use the stable route key so finalizing rid/served does not
+// change a row's identity underneath a scan. Legacy cursors stored source ids,
+// so both are accepted while the day is re-anchored.
+function sameCursor(row, key, salt) {
+  if (!key || !row) return false;
+  return cursorId(sourceKey(row, salt)) === key || cursorId(sourceId(row, salt)) === key;
+}
+
 function timestamp(row) {
   const value = row && typeof row === "object" && typeof row.t === "string" ? Date.parse(row.t) : NaN;
   return Number.isFinite(value) && value > 0 ? value : null;
@@ -96,7 +104,10 @@ async function readRange(state, options, day, start, end, {
     for (let index = 0; index < stop; index++) {
       const row = body.rows[index];
       const id = sourceId(row ?? {}, salt);
-      lastId = cursorId(id);
+      // The committed anchor is the stable route key; the source id remains
+      // the in-process seen key and queue id.
+      const key = sourceKey(row ?? {}, salt);
+      lastId = cursorId(key);
       const time = timestamp(row);
       if (time !== null) lastTime = time;
       consumed = index + 1;
@@ -106,7 +117,6 @@ async function readRange(state, options, day, start, end, {
       // A row already delivered (or durably queued) must survive a cursor
       // reset or process restart without a second heartbeat. The key is based
       // on the gateway's stable route id, not the mutable row source id.
-      const key = sourceKey(row ?? {}, salt);
       if (sent?.has(key)) { seen?.add(id, now); continue; }
       // A row repeated across pages means the listing shifted under the scan.
       // The set is per pass; the global seen set cannot detect this because a
@@ -171,7 +181,7 @@ async function verifyTail(state, options, day, cursor, { fetcher, signal, total 
   if (cursor.offset <= 0) return true;
   if (cursor.offset > (total ?? cursor.total)) return false;
   const row = await rowAt(options, day, cursor.offset - 1, { fetcher, signal });
-  return !!row && cursorId(sourceId(row, state.get("salt"))) === cursor.tail;
+  return !!row && sameCursor(row, cursor.tail, state.get("salt"));
 }
 
 async function findHead(state, options, day, first, target, { fetcher, signal, budget }) {
@@ -179,7 +189,7 @@ async function findHead(state, options, day, first, target, { fetcher, signal, b
   let offset = 0, body = first, pages = 0;
   while (offset < body.total && pages < budget) {
     for (let index = 0; index < body.rows.length; index++) {
-      if (cursorId(sourceId(body.rows[index], salt)) === target) return offset + index;
+      if (sameCursor(body.rows[index], target, salt)) return offset + index;
     }
     offset += body.rows.length;
     if (!body.rows.length || offset >= body.total) return -1;
@@ -189,11 +199,22 @@ async function findHead(state, options, day, first, target, { fetcher, signal, b
   return -1;
 }
 
-// The final probe uses the same salt the pass used, so it can compare the head
-// it started from without another parameter.
-async function stableHead(options, day, head, total, salt, { fetcher, signal }) {
-  const check = await sourcePage(options, day, 0, { fetcher, signal });
-  return check.total >= total && (check.rows.length ? cursorId(sourceId(check.rows[0], salt)) : null) === head;
+// New requests arrive at the front of this gateway. Between the pass start and
+// its final check the listing may have grown by `drift` rows; the pass-start
+// head must still be at that index, and the candidate tail at its shifted
+// index. New rows above the head stay outside the committed block; a middle
+// insertion moves one of the anchors and rejects the pass.
+async function stablePrefix(state, options, day, head, candidate, drift, salt, { fetcher, signal }) {
+  if (drift < 0) return false;
+  if (head) {
+    const anchor = await rowAt(options, day, drift, { fetcher, signal });
+    if (!anchor || !sameCursor(anchor, head, salt)) return false;
+  }
+  if (candidate && candidate.offset > 0) {
+    const tail = await rowAt(options, day, candidate.offset + drift - 1, { fetcher, signal });
+    if (!tail || !sameCursor(tail, candidate.tail, salt)) return false;
+  }
+  return true;
 }
 
 export async function collectDay(state, options, day, {
@@ -205,7 +226,7 @@ export async function collectDay(state, options, day, {
   const salt = state.get("salt");
   const cursor = state.cursor(day);
   const first = await sourcePage(options, day, 0, { fetcher, signal });
-  const head = first.rows.length ? cursorId(sourceId(first.rows[0], salt)) : null;
+  const head = first.rows.length ? cursorId(sourceKey(first.rows[0], salt)) : null;
   const total = first.total;
   // Shared by every range read in this pass so cross-page repeats and total
   // changes invalidate the pass for the whole day.
@@ -300,25 +321,28 @@ export async function collectDay(state, options, day, {
   if (pass.unstable) {
     return { ...result, cursor, complete: false, stable: false };
   }
-  // A tail append changes the total but not the processed prefix, so requiring
-  // an exact total would stall a busy gateway. Re-check the old cursor after
-  // the read instead: an insertion before the window moves its tail row, while
-  // a tail append leaves it in place. A reset result has already decided to
-  // re-read from zero, so the moved old tail must not reject the reset itself;
-  // the candidate-tail check below governs that path. Then verify the
-  // candidate's own tail so a shift inside the window cannot be committed.
+  // The process local seen set already stops a repeated read from sending the
+  // same row twice. These checks still protect the durable cursor: rows that
+  // arrived at the front during the pass are outside the committed block, and
+  // a middle insertion moves an anchor instead of being silently skipped.
   if (!result.reset && cursor && head === cursor.head &&
       !(await verifyTail(state, options, day, cursor, context))) {
     return { ...result, cursor, complete: false, stable: false };
   }
-  // The head id must be unchanged; the total may grow from tail appends.
-  if (!(await stableHead(options, day, head, total, salt, context))) {
+  const check = await sourcePage(options, day, 0, context);
+  const drift = check.total - total;
+  // A partial front keeps the old cursor unchanged; there is no new boundary
+  // to verify, only that the pass-start head moved by exactly the head growth.
+  const candidate = result.cursor && (!cursor || result.cursor.offset !== cursor.offset ||
+    result.cursor.head !== cursor.head || result.cursor.tail !== cursor.tail) ? result.cursor : null;
+  if (!(await stablePrefix(state, options, day, head, candidate, drift, salt, context))) {
     return { ...result, cursor, complete: false, stable: false };
   }
-  if (result.cursor && (!cursor || result.cursor.offset !== cursor.offset ||
-      result.cursor.tail !== cursor.tail) &&
-      !(await verifyTail(state, options, day, result.cursor, context))) {
-    return { ...result, cursor, complete: false, stable: false };
+  // A reset is only allowed to move the durable boundary forward. A shorter
+  // prefix would move it backwards, so keep the old cursor while still
+  // delivering the rows this pass found; the sent log makes the repeat safe.
+  if (result.reset && cursor && result.cursor && result.cursor.offset < cursor.offset) {
+    return { ...result, cursor, complete: false, stable: true };
   }
   return result;
 }
@@ -340,15 +364,15 @@ export async function seedKeys(state, options, day, cursor, {
     const body = await sourcePage(options, day, offset, { fetcher, signal });
     if (!body.rows.length) break;
     for (const row of body.rows) {
-      const id = cursorId(sourceId(row ?? {}, salt));
-      if (seen.has(id)) continue;
-      seen.add(id);
+      const key = sourceKey(row ?? {}, salt);
+      if (seen.has(key)) continue;
+      seen.add(key);
       if (!foundHead) {
-        if (id !== cursor.head) continue;
+        if (!sameCursor(row, cursor.head, salt)) continue;
         foundHead = true;
       }
-      keys.push(sourceKey(row ?? {}, salt));
-      if (id === cursor.tail) return keys.length === cursor.offset ? keys : null;
+      keys.push(key);
+      if (sameCursor(row, cursor.tail, salt)) return keys.length === cursor.offset ? keys : null;
     }
     offset += body.rows.length;
     pages++;
