@@ -14,9 +14,11 @@ export const CLAUDE_SESSION_MISS_TTL_MS = 5_000;
 export const CLAUDE_SESSION_MAX_BYTES = 256 * 1024 * 1024;
 
 const MAX_HEAD_BYTES = 64 * 1024;
-const MAX_TAIL_BYTES = 64 * 1024;
 const MAX_HEAD_LINES = 20;
-const MAX_TAIL_LINES = 20;
+// Tool-use lines can sit many lines before the transcript ends, so the tail is
+// wide enough for them while the head stays narrow. Both are literal-only.
+const MAX_TAIL_BYTES = 1 << 20;
+const MAX_TAIL_LINES = 500;
 const MAX_DIRECTORIES = 256;
 // Tool paths are only a language fallback. The cap bounds both the distinct
 // paths kept per session and the work done on one unusually large tool line.

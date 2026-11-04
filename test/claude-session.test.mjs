@@ -153,6 +153,22 @@ test("enforces the distinct tool-path cap", async () => {
   } finally { rmSync(root, { recursive: true }); }
 });
 
+test("finds tool paths more than 20 lines before the transcript ends", async () => {
+  const root = tempDirectory();
+  try {
+    const cwd = join(root, "late-tools");
+    mkdirSync(cwd);
+    const lines = [user(cwd), assistant(cwd, "main", session, ["/w/late.py"])];
+    // Bury the tool line 50 lines deep: outside the 20-line window, inside the
+    // 500-line / 1 MB tail window.
+    for (let index = 0; index < 50; index++) lines.push(user(cwd, "main", `filler-${index}`));
+    writeTranscript(root, { lines });
+    expect(await new ClaudeSessions({ root }).context(session)).toEqual({
+      project: "late-tools", branch: "main", language: "Python",
+    });
+  } finally { rmSync(root, { recursive: true }); }
+});
+
 test("returns null for missing, corrupt, oversized and non-Claude transcripts", async () => {
   const root = tempDirectory();
   try {
