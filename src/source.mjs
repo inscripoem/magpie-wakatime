@@ -86,14 +86,16 @@ function mergeContext(explicit, derived) {
 
 async function readRange(state, options, day, start, end, {
   now, fetcher, signal, contexts, claudeSessions, codexSessions, onMapped,
-  seen, sent, budget, pass, limit = Infinity,
+  seen, sent, budget, pageBudget, pass, limit = Infinity,
 }) {
   const salt = state.get("salt");
   const enabledAt = state.get("enabledAt");
+  const pageLimit = budget - (pageBudget?.used ?? 0);
   let offset = start, pages = 0, items = [], lastId = null, lastTime = 0;
-  while (offset < end && pages < budget) {
+  while (offset < end && pages < pageLimit) {
     const pageStart = offset;
     const body = await sourcePage(options, day, pageStart, { fetcher, signal });
+    if (pageBudget) pageBudget.used++;
     // A lower total means rows were removed between pages. A higher total is
     // a tail append and does not move the prefix; the post-read tail checks
     // catch a middle insertion.
@@ -232,7 +234,7 @@ export async function collectDay(state, options, day, {
   // changes invalidate the pass for the whole day.
   const pass = { total, ids: new Set(), unstable: false };
   const context = { now, fetcher, signal, contexts, claudeSessions, codexSessions, onMapped,
-    seen, sent, budget, total, pass, limit };
+    seen, sent, budget, pageBudget: { used: 0 }, total, pass, limit };
 
   let result;
   if (!cursor) {
@@ -310,6 +312,31 @@ export async function collectDay(state, options, day, {
           stable: true,
         };
       }
+    }
+  }
+
+  // Finish the older end in the same call. Under a continuously moving head
+  // the branch above may only have handled the front or reached the page
+  // budget, leaving rows below the committed tail. Continuing from the cursor
+  // offset keeps the backlog moving without waiting for a quiet minute.
+  if (result.cursor && result.cursor.offset < total && !result.complete &&
+      result.items.length < limit) {
+    const tail = await readRange(state, options, day, result.cursor.offset, total, {
+      ...context, limit: limit - result.items.length,
+    });
+    if (tail.items.length || tail.offset > result.cursor.offset) {
+      result = {
+        ...result,
+        items: [...result.items, ...tail.items],
+        cursor: {
+          offset: tail.offset,
+          head: result.cursor.head,
+          tail: tail.lastId ?? result.cursor.tail,
+          total,
+          time: tail.lastTime || result.cursor.time,
+        },
+        complete: tail.complete,
+      };
     }
   }
 

@@ -173,6 +173,61 @@ test("a row inserted during a pass still advances the durable cursor", async () 
   } finally { cleanup(directory, worker); }
 });
 
+test("a large front above a 10k-row cursor advances without resetting", async () => {
+  const rows = Array.from({ length: 10_000 }, (_, index) => row(index + 1));
+  const { directory, worker, fetcher } = setup(rows);
+  try {
+    const salt = worker.state.salt;
+    worker.state.setCursor(day, {
+      offset: 10_000,
+      head: cursorId(sourceKey(rows[0], salt)),
+      tail: cursorId(sourceKey(rows[9_999], salt)),
+      total: 10_000,
+      time: Date.parse(rows[9_999].t),
+    });
+    worker.state.flush(now, true);
+    worker.state.lastFlush = now;
+    // A later burst adds 500 requests above the committed cursor.
+    for (let index = 0; index < 500; index++) rows.unshift(row(20_000 + index));
+    await worker.tick(now);
+    await worker.tick(now + 31_000);
+    expect(worker.state.cursor(day)?.offset).toBe(10_500);
+    const sent = fetcher.calls.flat();
+    const times = sent.map((payload) => payload.time);
+    expect(new Set(times).size).toBe(times.length);
+    expect(times).toHaveLength(500);
+  } finally { cleanup(directory, worker); }
+});
+
+test("a moving head does not starve the older backlog", async () => {
+  // 10,000 committed rows at the top, 2,000 older rows below them, and 500 new
+  // requests above. The front and the backlog must both advance.
+  const rows = Array.from({ length: 12_000 }, (_, index) => row(index + 1));
+  const { directory, worker, fetcher } = setup(rows);
+  try {
+    const salt = worker.state.salt;
+    worker.state.setCursor(day, {
+      offset: 10_000,
+      head: cursorId(sourceKey(rows[0], salt)),
+      tail: cursorId(sourceKey(rows[9_999], salt)),
+      total: 12_000,
+      time: Date.parse(rows[9_999].t),
+    });
+    worker.state.flush(now, true);
+    worker.state.lastFlush = now;
+    for (let index = 0; index < 500; index++) rows.unshift(row(20_000 + index));
+    for (let tick = 0; tick < 6; tick++) {
+      await worker.tick(now + tick * 31_000);
+      if ((worker.state.cursor(day)?.offset ?? 0) >= 12_500) break;
+    }
+    expect(worker.state.cursor(day)?.offset).toBe(12_500);
+    const sent = fetcher.calls.flat();
+    const times = sent.map((payload) => payload.time);
+    expect(new Set(times).size).toBe(times.length);
+    expect(times).toHaveLength(2_500);
+  } finally { cleanup(directory, worker); }
+});
+
 test("excludeCallerKeys must be an array of labels", () => {
   expect(() => readOptions({ excludeCallerKeys: "friend" })).toThrow("invalid-config");
   expect(() => readOptions({ excludeCallerKeys: [""] })).toThrow("invalid-config");
