@@ -1,8 +1,9 @@
 import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import { completeLines, stringField } from "./transcript-fields.mjs";
+import { completeLines, stringField, stringFields } from "./transcript-fields.mjs";
 import { languageForCwd } from "./git-language.mjs";
+import { languageForFile } from "./language.mjs";
 
 export const CLAUDE_SESSION_TTL_MS = 10 * 60_000;
 // A miss is retried soon: a session that starts just after a heartbeat should
@@ -17,9 +18,31 @@ const MAX_TAIL_BYTES = 64 * 1024;
 const MAX_HEAD_LINES = 20;
 const MAX_TAIL_LINES = 20;
 const MAX_DIRECTORIES = 256;
+// Tool paths are only a language fallback. The cap bounds both the distinct
+// paths kept per session and the work done on one unusually large tool line.
+const MAX_PATH_ENTRIES = 4_096;
+const MAX_PATHS_PER_LINE = 256;
+const PATH_KEYS = ["file_path", "notebook_path"];
 // The transcript file is named after the session, so the id must be a plain
 // filename component: no separators, no traversal.
 const SESSION_ID = /^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$/;
+
+// Same mapping and tie-break as the reply parser: a tool path names a file
+// explicitly, so documents count as well as programming languages.
+function dominant(paths) {
+  const counts = new Map();
+  for (const path of paths) {
+    const language = languageForFile(path);
+    if (language) counts.set(language, (counts.get(language) ?? 0) + 1);
+  }
+  let best = null;
+  for (const [language, count] of counts) {
+    if (!best || count > best.count || (count === best.count && language < best.language)) {
+      best = { language, count };
+    }
+  }
+  return best?.language ?? null;
+}
 
 function readAt(fd, offset, length) {
   const buffer = Buffer.allocUnsafe(length);
@@ -37,11 +60,13 @@ function readAt(fd, offset, length) {
 export class ClaudeSessions {
   constructor({
     root = null, env = process.env, ttl = CLAUDE_SESSION_TTL_MS, capacity = 128,
+    pathLimit = MAX_PATH_ENTRIES,
   } = {}) {
     this._root = root;
     this._env = env;
     this.ttl = ttl;
     this.capacity = capacity;
+    this.pathLimit = Number.isSafeInteger(pathLimit) && pathLimit > 0 ? pathLimit : MAX_PATH_ENTRIES;
     // session -> { at, file, value }. value is only the derived context:
     // project, branch and a language inferred from the recovered cwd. No path,
     // prompt, reply, transcript line or tool output is retained.
@@ -123,17 +148,21 @@ export class ClaudeSessions {
     if (!metadata) return null;
     const value = { project: metadata.project };
     if (metadata.branch) value.branch = metadata.branch;
-    // The transcript is not a source of language. Reuse the request hook's
-    // Git-based detection on the recovered cwd instead.
-    const language = await languageForCwd(metadata.cwd, { signal });
+    // Git detection on the recovered cwd is the primary signal. Only when it
+    // finds nothing does the dominant tool-path extension decide the language.
+    let language = await languageForCwd(metadata.cwd, { signal });
+    if (!language) language = metadata.toolLanguage;
     if (language) value.language = language;
     return value;
   }
 
   // Metadata-only: cwd, gitBranch and the session id are extracted from their
-  // string literals. No message or tool-use line is ever JSON-parsed.
+  // string literals. Tool-use lines contribute only file_path/notebook_path
+  // literals; no message or tool-use line is ever JSON-parsed, and the paths
+  // are discarded after the dominant language is computed.
   parse(lines, session) {
     let cwd = null, branch = null, matched = false, sawSessionField = false, shape = false;
+    const paths = new Set();
     for (const line of lines) {
       if (!line.trim()) continue;
       // Top-level metadata is serialized before the message object. Never look
@@ -147,8 +176,8 @@ export class ClaudeSessions {
       const id = stringField(metadata, "sessionId") ?? stringField(metadata, "session_id");
       if (typeof id === "string" && id) {
         sawSessionField = true;
-        // A subagent line can belong to another session; its cwd must not
-        // decide this session's context.
+        // A subagent line can belong to another session; its cwd and paths
+        // must not decide this session's context.
         if (id !== session) continue;
         matched = true;
       }
@@ -156,12 +185,20 @@ export class ClaudeSessions {
       if (typeof nextCwd === "string" && isAbsolute(nextCwd)) cwd = nextCwd;
       const nextBranch = stringField(metadata, "gitBranch");
       if (typeof nextBranch === "string" && nextBranch && nextBranch !== "HEAD") branch = nextBranch;
+      if (paths.size >= this.pathLimit || !line.includes('"tool_use"')) continue;
+      for (const key of PATH_KEYS) {
+        if (paths.size >= this.pathLimit) break;
+        for (const value of stringFields(line, key, { limit: MAX_PATHS_PER_LINE })) {
+          if (paths.size >= this.pathLimit) break;
+          paths.add(value);
+        }
+      }
     }
     if (!matched && (sawSessionField || !shape)) return null;
     if (!cwd) return null;
     const project = basename(resolve(cwd));
     if (!project) return null;
-    return { cwd, project, branch };
+    return { cwd, project, branch, toolLanguage: dominant(paths) };
   }
 
   evict() {

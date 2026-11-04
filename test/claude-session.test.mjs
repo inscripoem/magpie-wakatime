@@ -42,32 +42,32 @@ function user(cwd, branch = "main", text = "private-prompt", id = session) {
   };
 }
 
-// Tool-use content is deliberately present. It must not influence the result
-// or be retained in the cache.
-function assistant(cwd, branch = "main", id = session) {
+// Tool-use content is deliberately present. Only file_path/notebook_path
+// literals may influence the result; nothing from the tool input is retained.
+function assistant(cwd, branch = "main", id = session,
+  paths = ["/sentinel/private.rs"], sentinel = "private-body") {
   return {
     type: "assistant", sessionId: id, cwd, gitBranch: branch, parentUuid: "p2", uuid: "u2",
     message: { role: "assistant", content: [
       { type: "text", text: "private-answer" },
-      { type: "tool_use", id: "t1", name: "Write", input: {
-        file_path: "/sentinel/private.rs", content: "private-body",
-      } },
+      ...paths.map((path, index) => ({ type: "tool_use", id: `t${index}`, name: "Write",
+        input: { file_path: path, content: sentinel } })),
     ] },
   };
 }
 
-test("derives metadata only and takes language from the recovered cwd's Git index", async () => {
+test("derives metadata only and prefers the recovered cwd's Git language", async () => {
   const root = tempDirectory();
   try {
     const cwd = repo(root, "real-repo", ["src/app.ts", "src/lib.ts", "src/util.js", "notes.md"]);
-    writeTranscript(root, { lines: [user(cwd), assistant(cwd)] });
+    writeTranscript(root, { lines: [user(cwd), assistant(cwd, "main", session, ["/sentinel/solution.py"])] });
     const sessions = new ClaudeSessions({ root });
     expect(await sessions.context(session)).toEqual({
       project: "real-repo", branch: "main", language: "TypeScript",
     });
     const cached = JSON.stringify(sessions.sessions);
     for (const secret of ["private-prompt", "private-answer", "private-body",
-      "/sentinel/private.rs", "private.rs"]) {
+      "/sentinel/private.rs", "/sentinel/solution.py", "private.rs"]) {
       expect(cached).not.toContain(secret);
     }
   } finally { rmSync(root, { recursive: true }); }
@@ -111,6 +111,45 @@ test("omits language when the recovered cwd is gone or is not a Git repository",
     expect(await new ClaudeSessions({ root }).context(other)).toEqual({
       project: "plain-repo", branch: "main",
     });
+  } finally { rmSync(root, { recursive: true }); }
+});
+
+test("falls back to the dominant tool-path language when cwd is not a Git repo", async () => {
+  const root = tempDirectory();
+  try {
+    const cwd = join(root, "koishi-workspace");
+    mkdirSync(cwd);
+    // The sentinel lives in the tool input's content, and repeats an escaped
+    // file_path-shaped string. Only the real file_path/notebook_path literals
+    // may influence the language.
+    const escaped = JSON.stringify({ file_path: "/sentinel/private.rs" });
+    const sentinel = `private-sentinel ${escaped} ${escaped} ${escaped} ${escaped} ${escaped}`;
+    writeTranscript(root, { lines: [
+      user(cwd), assistant(cwd, "main", session, ["/w/a.py", "/w/b.py"], sentinel),
+    ] });
+    const sessions = new ClaudeSessions({ root });
+    expect(await sessions.context(session)).toEqual({
+      project: "koishi-workspace", branch: "main", language: "Python",
+    });
+    const cached = JSON.stringify(sessions.sessions);
+    for (const secret of ["private-sentinel", "/w/a.py", "/w/b.py", "private.rs", "private-answer"]) {
+      expect(cached).not.toContain(secret);
+    }
+  } finally { rmSync(root, { recursive: true }); }
+});
+
+test("enforces the distinct tool-path cap", async () => {
+  const root = tempDirectory();
+  try {
+    const cwd = join(root, "acgn-lab");
+    mkdirSync(cwd);
+    writeTranscript(root, { lines: [
+      user(cwd), assistant(cwd, "main", session, ["/w/a.py", "/w/b.rs", "/w/c.rs"]),
+    ] });
+    // Without a cap the two Rust paths win; with one path only Python remains.
+    expect((await new ClaudeSessions({ root }).context(session)).language).toBe("Rust");
+    expect((await new ClaudeSessions({ root, pathLimit: 1 }).context(session)).language)
+      .toBe("Python");
   } finally { rmSync(root, { recursive: true }); }
 });
 

@@ -25,3 +25,26 @@ export function completeLines(text, atEnd) {
   }
   return text ? text.split("\n").filter(Boolean) : [];
 }
+
+// All occurrences of a named string field on one raw line. Only the matched
+// string literal is decoded; the line itself is never JSON-parsed, and escaped
+// occurrences inside prompt/reply text are skipped. The scan is bounded.
+export function stringFields(line, name, { limit = 256 } = {}) {
+  if (typeof line !== "string" || !line || !Number.isSafeInteger(limit) || limit <= 0) return [];
+  const values = [];
+  const marker = `"${name}"`;
+  let index = line.indexOf(marker);
+  while (index >= 0 && values.length < limit) {
+    if (index === 0 || line[index - 1] !== "\\") {
+      const match = /^\s*:\s*("(?:[^"\\]|\\.)*")/.exec(line.slice(index + marker.length));
+      if (match) {
+        try {
+          const value = JSON.parse(match[1]);
+          if (typeof value === "string" && value) values.push(value);
+        } catch { /* a torn literal is skipped */ }
+      }
+    }
+    index = line.indexOf(marker, index + marker.length);
+  }
+  return values;
+}
