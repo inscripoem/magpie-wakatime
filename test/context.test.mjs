@@ -272,3 +272,38 @@ test("reads Codex file changes from the session transcript", async () => {
     rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
   }
 });
+
+test("records bounded per-agent noCwd counts in diagnostics and status", async () => {
+  const directory = tempDirectory();
+  const options = readOptions(), worker = new Sync(directory, options);
+  try {
+    worker.state.activate(options.gatewayUrl, Date.now());
+    bindWorker(worker);
+    await onRequest({}, { origin: "local", agent: "claude", state: {} });
+    expect(worker.hookSnapshot().noCwdAgents).toEqual({ claude: 1 });
+
+    for (let index = 0; index < 12; index++) {
+      worker.countHook("noCwd", `agent-${String(index).padStart(2, "0")}`);
+    }
+    worker.countHook("noCwd", "agent-00");
+    worker.countHook("noCwd", "");
+    worker.countHook("noCwd", "");
+    worker.countHook("noCwd", "");
+    const snapshot = worker.hookSnapshot();
+    expect(snapshot.noCwd).toBe(17);
+    expect(Object.keys(snapshot.noCwdAgents)).toHaveLength(8);
+    expect(snapshot.noCwdAgents["agent-00"]).toBe(2);
+    expect(snapshot.noCwdAgents.unknown).toBe(3);
+    const entries = Object.entries(snapshot.noCwdAgents);
+    for (let index = 1; index < entries.length; index++) {
+      expect(entries[index - 1][1]).toBeGreaterThanOrEqual(entries[index][1]);
+    }
+
+    worker.persistContextStats();
+    expect(worker.state.get("contextStats").hook.noCwdAgents).toEqual(snapshot.noCwdAgents);
+    expect(worker.status().contextStats.hook.noCwdAgents).toEqual(snapshot.noCwdAgents);
+  } finally {
+    await worker.stop();
+    rmSync(directory, { recursive: true, maxRetries: 5, retryDelay: 50 });
+  }
+});

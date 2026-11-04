@@ -8,6 +8,7 @@ import { Contexts, CONTEXT_TTL_MS } from "./contexts.mjs";
 import { Queue, QueueFullError, QUEUE_CAPACITY, ACK_RETENTION_MS, queueStatus } from "./queue.mjs";
 import { BATCH_ROWS, EnqueueBuffer, AckGate } from "./batching.mjs";
 import { collectDay, localDay } from "./source.mjs";
+import { ClaudeSessions } from "./claude-session.mjs";
 import { readApiKey, defaultDirectory } from "./config.mjs";
 import { defaultUserAgent } from "./user-agent.mjs";
 
@@ -20,6 +21,10 @@ const SCAN_WINDOWS = 32;
 const PRUNE_MS = 6 * 3_600_000;
 const SEEN_TTL_MS = 3 * 86_400_000;
 const SEEN_CAPACITY = 60_000;
+// Internal bound for distinct agent names seen without cwd; status reports
+// only the largest eight so one unusual client cannot grow the diagnostic.
+const NO_CWD_AGENT_CAPACITY = 64;
+const NO_CWD_AGENT_TOP = 8;
 
 export function retryDelay(attempt, header, now) {
   const seconds = header && Number(header);
@@ -106,7 +111,7 @@ function permanent(code) {
 export class Sync {
   constructor(directory, options, {
     env = process.env, enabled = () => true, fetcher = fetch, sourceFetcher = fetch, now = Date.now(),
-    queueCapacity = QUEUE_CAPACITY,
+    queueCapacity = QUEUE_CAPACITY, claudeSessions = null,
   } = {}) {
     const stateDirectory = join(directory, "magpie-wakatime");
     mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
@@ -114,6 +119,7 @@ export class Sync {
     this.contexts = new Contexts({
       ttl: CONTEXT_TTL_MS, journal: join(stateDirectory, "contexts.log"), now,
     });
+    this.claudeSessions = claudeSessions ?? new ClaudeSessions({ env });
     this.queue = new Queue(join(stateDirectory, "queue.sqlite"), { capacity: queueCapacity });
     // A's buffer and staged commits are reused unchanged: mapped rows wait
     // here until 25 rows or one window, and no cursor moves past them.
@@ -143,11 +149,36 @@ export class Sync {
       ok: 0, stopped: 0, disabled: 0, notActivated: 0, origin: 0, excludedAgent: 0,
       noCwd: 0, aborted: 0, notDirectory: 0, projectEmpty: 0, discarded: 0, error: 0,
     };
+    this.noCwdAgents = new Map();
     this.stopped = false;
   }
 
-  countHook(reason) {
+  countHook(reason, agent) {
     if (Object.hasOwn(this.hookStats, reason)) this.hookStats[reason]++;
+    if (reason === "noCwd") this.countNoCwdAgent(agent);
+  }
+
+  countNoCwdAgent(value) {
+    const agent = typeof value === "string" && value.trim()
+      ? value.trim().slice(0, 255) : "unknown";
+    this.noCwdAgents.set(agent, (this.noCwdAgents.get(agent) ?? 0) + 1);
+    if (this.noCwdAgents.size <= NO_CWD_AGENT_CAPACITY) return;
+    let smallest = null;
+    for (const [key, count] of this.noCwdAgents) {
+      if (!smallest || count < smallest.count || (count === smallest.count && key > smallest.key)) {
+        smallest = { key, count };
+      }
+    }
+    this.noCwdAgents.delete(smallest.key);
+  }
+
+  // Counts plus the bounded per-agent noCwd map used in diagnostics and
+  // status. A new object each time keeps the state snapshot immutable.
+  hookSnapshot() {
+    const noCwdAgents = [...this.noCwdAgents.entries()]
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .slice(0, NO_CWD_AGENT_TOP);
+    return { ...this.hookStats, noCwdAgents: Object.fromEntries(noCwdAgents) };
   }
 
   // Diagnose why usage rows lose their project and language: how often the
@@ -155,7 +186,7 @@ export class Sync {
   // Numbers only; they ride the next cursor flush and appear in `status`.
   persistContextStats() {
     this.state.setDiagnostic("contextStats", {
-      hook: { ...this.hookStats },
+      hook: this.hookSnapshot(),
       lookup: this.contexts.stats(),
     });
   }
@@ -166,7 +197,8 @@ export class Sync {
   collectOptions(now, limit = BATCH_ROWS) {
     return {
       now, signal: this.abort.signal, fetcher: this.sourceFetcher,
-      contexts: this.contexts, seen: this.seen, budget: 20, limit,
+      contexts: this.contexts, claudeSessions: this.claudeSessions,
+      seen: this.seen, budget: 20, limit,
     };
   }
 
@@ -539,7 +571,7 @@ export class Sync {
       ...this.state.status(now),
       ...this.stats,
       active: this.hasLease,
-      contextStats: { hook: { ...this.hookStats }, lookup: this.contexts.stats() },
+      contextStats: { hook: this.hookSnapshot(), lookup: this.contexts.stats() },
       contexts: this.contexts.size(),
       seen: this.seen.size,
       queue: this.queue.status(),

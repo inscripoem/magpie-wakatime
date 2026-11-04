@@ -36,7 +36,7 @@ export async function onRequest(_body, ctx) {
   if (current.state.get("enabledAt") === null) { current.countHook?.("notActivated"); return; }
   if (ctx.origin !== "local") { current.countHook?.("origin"); return; }
   if (current.options.excludeAgents.includes(ctx.agent)) { current.countHook?.("excludedAgent"); return; }
-  if (typeof ctx.cwd !== "string" || !isAbsolute(ctx.cwd)) { current.countHook?.("noCwd"); return; }
+  if (typeof ctx.cwd !== "string" || !isAbsolute(ctx.cwd)) { current.countHook?.("noCwd", ctx.agent); return; }
   if (ctx.signal?.aborted) { current.countHook?.("aborted"); return; }
   try {
     if (!(await stat(ctx.cwd)).isDirectory()) { current.countHook?.("notDirectory"); return; }

@@ -45,8 +45,18 @@ function timestamp(row) {
 // caps the mapped offers per call: the returned cursor names exactly the
 // processed prefix, including rows skipped as already seen or filtered, so a
 // window can commit without waiting for the rest of the listing.
+// A gateway row only names the client session. Claude Code writes its
+// transcript beside the same id, so a row whose request hook had no cwd can
+// still recover project, branch and language locally. Only a Claude row is
+// consulted; other agents keep the configured fallback.
+function fallbackContext(row, claudeSessions, now) {
+  if (!claudeSessions || typeof row?.agent !== "string" || row.agent.trim() !== "claude") return null;
+  try { return claudeSessions.context(row.native_session || row.session, now); }
+  catch { return null; }
+}
+
 async function readRange(state, options, day, start, end, {
-  now, fetcher, signal, contexts, seen, budget, pass, limit = Infinity,
+  now, fetcher, signal, contexts, claudeSessions, seen, budget, pass, limit = Infinity,
 }) {
   const salt = state.get("salt");
   const enabledAt = state.get("enabledAt");
@@ -78,7 +88,11 @@ async function readRange(state, options, day, start, end, {
       else pass.ids.add(id);
       let payload;
       try {
-        payload = mapRow(row, options, salt, contexts?.get(row, now) ?? null);
+        // An explicit memory/journal context always wins. Only a miss consults
+        // the transcript fallback, and mapRow still lets projectByAgent
+        // override the fallback's project.
+        const context = contexts?.get(row, now) ?? fallbackContext(row, claudeSessions, now);
+        payload = mapRow(row, options, salt, context);
       } catch (error) {
         if (error.message !== "invalid-row") throw error;
         state.setDiagnostic("lastInvalidRow", { day, offset: pageStart + index, id, error: "invalid-row" });
@@ -151,7 +165,7 @@ async function stableHead(options, day, head, total, salt, { fetcher, signal }) 
 }
 
 export async function collectDay(state, options, day, {
-  now = Date.now(), fetcher = fetch, signal, contexts = null, seen = null, budget = 20,
+  now = Date.now(), fetcher = fetch, signal, contexts = null, claudeSessions = null, seen = null, budget = 20,
   limit = Infinity,
 } = {}) {
   const enabledAt = state.get("enabledAt");
@@ -164,7 +178,7 @@ export async function collectDay(state, options, day, {
   // Shared by every range read in this pass so cross-page repeats and total
   // changes invalidate the pass for the whole day.
   const pass = { total, ids: new Set(), unstable: false };
-  const context = { now, fetcher, signal, contexts, seen, budget, total, pass, limit };
+  const context = { now, fetcher, signal, contexts, claudeSessions, seen, budget, total, pass, limit };
 
   let result;
   if (!cursor) {
