@@ -265,7 +265,7 @@ export class Sync {
       claudeSessions: fallback ? this.claudeSessions : null,
       codexSessions: fallback ? this.codexSessions : null,
       onMapped: (agent, hasLanguage) => this.countMapped(agent, hasLanguage),
-      seen: this.seen, sent: this.sent, budget: 20, limit,
+      seen: this.seen, sent: this.sent, budget: 60, limit,
     };
   }
 

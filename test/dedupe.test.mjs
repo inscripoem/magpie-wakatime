@@ -228,6 +228,20 @@ test("a moving head does not starve the older backlog", async () => {
   } finally { cleanup(directory, worker); }
 });
 
+test("a reset can skip a 10k sent prefix and reach the unsent tail", async () => {
+  const rows = Array.from({ length: 10_025 }, (_, index) => row(index + 1));
+  const { directory, worker, fetcher } = setup(rows);
+  try {
+    const salt = worker.state.salt;
+    worker.sent.add(rows.slice(0, 10_000).map((value) => sourceKey(value, salt)), now);
+    await worker.tick(now);
+    expect(worker.state.cursor(day)?.offset).toBe(10_025);
+    const sent = fetcher.calls.flat();
+    expect(sent).toHaveLength(25);
+    expect(sent[0].time).toBe(Date.parse(rows[10_000].t) / 1000);
+  } finally { cleanup(directory, worker); }
+});
+
 test("excludeCallerKeys must be an array of labels", () => {
   expect(() => readOptions({ excludeCallerKeys: "friend" })).toThrow("invalid-config");
   expect(() => readOptions({ excludeCallerKeys: [""] })).toThrow("invalid-config");
