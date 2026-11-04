@@ -26,6 +26,10 @@ const SEEN_CAPACITY = 60_000;
 // only the largest eight so one unusual client cannot grow the diagnostic.
 const NO_CWD_AGENT_CAPACITY = 64;
 const NO_CWD_AGENT_TOP = 8;
+// The mapped-language diagnostic is bounded the same way: 64 distinct agents
+// internally, the eight largest in status and persisted diagnostics.
+const MAPPED_AGENT_CAPACITY = 64;
+const MAPPED_AGENT_TOP = 8;
 
 export function retryDelay(attempt, header, now) {
   const seconds = header && Number(header);
@@ -158,6 +162,9 @@ export class Sync {
       noCwd: 0, aborted: 0, notDirectory: 0, projectEmpty: 0, discarded: 0, error: 0,
     };
     this.noCwdAgents = new Map();
+    this.mappedAgents = new Map();
+    this.mappedTotal = 0;
+    this.mappedNoLanguage = 0;
     this.stopped = false;
   }
 
@@ -189,6 +196,42 @@ export class Sync {
     return { ...this.hookStats, noCwdAgents: Object.fromEntries(noCwdAgents) };
   }
 
+  // Counted after a row becomes a heartbeat. Only aggregate counts are kept;
+  // no row, path, project or language value is stored here.
+  countMapped(value, hasLanguage) {
+    const agent = typeof value === "string" && value.trim()
+      ? value.trim().slice(0, 255) : "unknown";
+    this.mappedTotal++;
+    if (!hasLanguage) this.mappedNoLanguage++;
+    const entry = this.mappedAgents.get(agent) ?? { total: 0, noLanguage: 0 };
+    entry.total++;
+    if (!hasLanguage) entry.noLanguage++;
+    this.mappedAgents.set(agent, entry);
+    if (this.mappedAgents.size <= MAPPED_AGENT_CAPACITY) return;
+    let smallest = null;
+    for (const [key, value] of this.mappedAgents) {
+      if (!smallest || value.total < smallest.total ||
+          (value.total === smallest.total && (value.noLanguage < smallest.noLanguage ||
+          (value.noLanguage === smallest.noLanguage && key > smallest.key)))) {
+        smallest = { key, total: value.total, noLanguage: value.noLanguage };
+      }
+    }
+    this.mappedAgents.delete(smallest.key);
+  }
+
+  mappedSnapshot() {
+    const agents = [...this.mappedAgents.entries()]
+      .sort((a, b) => b[1].total - a[1].total || b[1].noLanguage - a[1].noLanguage ||
+        (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .slice(0, MAPPED_AGENT_TOP)
+      .map(([name, value]) => [name, { ...value }]);
+    return {
+      total: this.mappedTotal,
+      noLanguage: this.mappedNoLanguage,
+      agents: Object.fromEntries(agents),
+    };
+  }
+
   // Diagnose why usage rows lose their project and language: how often the
   // request hook set a context, and how often the scan failed to find one.
   // Numbers only; they ride the next cursor flush and appear in `status`.
@@ -196,6 +239,7 @@ export class Sync {
     this.state.setDiagnostic("contextStats", {
       hook: this.hookSnapshot(),
       lookup: this.contexts.stats(),
+      mapped: this.mappedSnapshot(),
     });
   }
 
@@ -210,6 +254,7 @@ export class Sync {
       contexts: this.contexts,
       claudeSessions: fallback ? this.claudeSessions : null,
       codexSessions: fallback ? this.codexSessions : null,
+      onMapped: (agent, hasLanguage) => this.countMapped(agent, hasLanguage),
       seen: this.seen, budget: 20, limit,
     };
   }
@@ -583,7 +628,7 @@ export class Sync {
       ...this.state.status(now),
       ...this.stats,
       active: this.hasLease,
-      contextStats: { hook: this.hookSnapshot(), lookup: this.contexts.stats() },
+      contextStats: { hook: this.hookSnapshot(), lookup: this.contexts.stats(), mapped: this.mappedSnapshot() },
       contexts: this.contexts.size(),
       seen: this.seen.size,
       queue: this.queue.status(),

@@ -77,7 +77,8 @@ function mergeContext(explicit, derived) {
 }
 
 async function readRange(state, options, day, start, end, {
-  now, fetcher, signal, contexts, claudeSessions, codexSessions, seen, budget, pass, limit = Infinity,
+  now, fetcher, signal, contexts, claudeSessions, codexSessions, onMapped,
+  seen, budget, pass, limit = Infinity,
 }) {
   const salt = state.get("salt");
   const enabledAt = state.get("enabledAt");
@@ -125,6 +126,10 @@ async function readRange(state, options, day, start, end, {
         seen?.add(id, now);
         continue;
       }
+      // Aggregate diagnostics only; a callback failure must not affect the
+      // mapped heartbeat or the cursor.
+      try { onMapped?.(row.agent, payload.language !== undefined); }
+      catch { /* diagnostics are best-effort */ }
       items.push({ id, payload });
       if (items.length >= limit) { full = true; break; }
     }
@@ -188,7 +193,7 @@ async function stableHead(options, day, head, total, salt, { fetcher, signal }) 
 
 export async function collectDay(state, options, day, {
   now = Date.now(), fetcher = fetch, signal, contexts = null, claudeSessions = null,
-  codexSessions = null, seen = null, budget = 20, limit = Infinity,
+  codexSessions = null, onMapped = null, seen = null, budget = 20, limit = Infinity,
 } = {}) {
   const enabledAt = state.get("enabledAt");
   if (enabledAt === null) return { items: [], cursor: null, complete: true, stable: true };
@@ -200,7 +205,8 @@ export async function collectDay(state, options, day, {
   // Shared by every range read in this pass so cross-page repeats and total
   // changes invalidate the pass for the whole day.
   const pass = { total, ids: new Set(), unstable: false };
-  const context = { now, fetcher, signal, contexts, claudeSessions, codexSessions, seen, budget, total, pass, limit };
+  const context = { now, fetcher, signal, contexts, claudeSessions, codexSessions, onMapped,
+    seen, budget, total, pass, limit };
 
   let result;
   if (!cursor) {

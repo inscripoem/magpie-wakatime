@@ -77,14 +77,14 @@ export class CodexSessions {
       const file = join(dir, name);
       this.sessions.set(session, {
         file, offset: 0, remainder: "", language: null, checked: Date.now(),
-        cwd: null, cwdChecked: false,
+        cwd: null, branch: null, metaChecked: false,
       });
       this.evict();
       return file;
     }
     this.sessions.set(session, {
       file: null, offset: 0, remainder: "", language: null, checked: Date.now(),
-      cwd: null, cwdChecked: true,
+      cwd: null, branch: null, metaChecked: true,
     });
     this.evict();
     return null;
@@ -98,29 +98,30 @@ export class CodexSessions {
     for (const [session] of oldest) this.sessions.delete(session);
   }
 
-  // The first rollout line is session_meta. Only its `cwd` string is decoded;
-  // the rest of the line (instructions, prompts) is left unparsed and is never
-  // cached. The head read and line count are bounded.
+  // The first rollout line is session_meta. Only its `cwd` and `git.branch`
+  // strings are decoded, and only before the base_instructions boundary; the
+  // rest of the line (instructions, prompts) is never parsed or cached. The
+  // head read and line count are bounded.
   metadata(session) {
     const file = this.find(session);
     if (!file) return null;
     const state = this.sessions.get(session);
-    if (state.cwdChecked) return state.cwd;
-    state.cwdChecked = true;
+    if (state.metaChecked) return { cwd: state.cwd, branch: state.branch };
+    state.metaChecked = true;
     let fileSize, length;
     try {
       const info = statSync(file);
-      if (!info.isFile() || info.size <= 0) return null;
+      if (!info.isFile() || info.size <= 0) return { cwd: state.cwd, branch: state.branch };
       fileSize = info.size;
       length = Math.min(fileSize, MAX_META_BYTES);
-    } catch { return null; }
+    } catch { return { cwd: state.cwd, branch: state.branch }; }
     const buffer = Buffer.allocUnsafe(length);
     let read = 0, fd;
     try {
       fd = openSync(file, "r");
       read = readSync(fd, buffer, 0, length, 0);
     } catch {
-      return state.cwd;
+      return { cwd: state.cwd, branch: state.branch };
     } finally {
       if (fd !== undefined) try { closeSync(fd); } catch { /* remain a miss */ }
     }
@@ -128,36 +129,40 @@ export class CodexSessions {
       .slice(0, MAX_META_LINES);
     for (const line of lines) {
       if (!line.includes('"session_meta"')) continue;
-      // session_meta serializes cwd before base_instructions. Stop at that
-      // boundary so instructions can never supply a cwd.
+      // session_meta serializes cwd and git before base_instructions. Stop at
+      // that boundary so instructions can never supply either field.
       const instructions = line.indexOf('"base_instructions"');
       const metadata = instructions < 0 ? line : line.slice(0, instructions);
       const cwd = stringField(metadata, "cwd");
-      if (typeof cwd === "string" && isAbsolute(cwd)) {
-        state.cwd = cwd;
-        return cwd;
-      }
+      if (typeof cwd === "string" && isAbsolute(cwd)) state.cwd = cwd;
+      const branch = stringField(metadata, "branch");
+      if (typeof branch === "string" && branch && branch !== "HEAD") state.branch = branch;
+      break;
     }
-    return state.cwd;
+    return { cwd: state.cwd, branch: state.branch };
   }
 
   // Scan-time context. When the rollout names a cwd, the language comes from
-  // the same read-only Git detection the request hook uses. A rollout without
-  // cwd keeps the FileChange path-based language.
+  // the same read-only Git detection the request hook uses, falling back to
+  // the FileChange path language when the cwd is not a Git repository. A
+  // rollout without cwd keeps the FileChange language alone.
   async context(session, { signal, now = Date.now() } = {}) {
     const file = this.find(session);
     if (!file) return null;
-    const cwd = this.metadata(session);
+    const metadata = this.metadata(session);
+    const cwd = metadata?.cwd ?? null;
+    const branch = metadata?.branch ?? null;
+    const language = cwd
+      ? (await languageForCwd(cwd, { signal, now })) ?? this.language(session)
+      : this.language(session);
+    const value = {};
     if (cwd) {
-      const language = await languageForCwd(cwd, { signal, now });
       const project = basename(resolve(cwd));
-      const value = {};
       if (project) value.project = project;
-      if (language) value.language = language;
-      return Object.keys(value).length ? value : null;
     }
-    const language = this.language(session);
-    return language ? { language } : null;
+    if (branch) value.branch = branch;
+    if (language) value.language = language;
+    return Object.keys(value).length ? value : null;
   }
 
   language(session) {

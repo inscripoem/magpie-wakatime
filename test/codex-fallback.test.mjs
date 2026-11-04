@@ -39,7 +39,7 @@ function sessionDirectory(home) {
 }
 
 function writeCodexSession(home, {
-  session = codexSession, cwd = null, files = [], sentinel = true,
+  session = codexSession, cwd = null, files = [], sentinel = true, branch = "main",
 } = {}) {
   const directory = sessionDirectory(home);
   mkdirSync(directory, { recursive: true });
@@ -47,7 +47,7 @@ function writeCodexSession(home, {
     timestamp: new Date().toISOString(), type: "session_meta",
     payload: {
       session_id: session, id: session, timestamp: new Date().toISOString(),
-      cwd, git: { branch: "main" },
+      cwd, git: branch === null ? null : { branch },
       base_instructions: sentinel ? { text: "private-instructions" } : {},
     },
   }];
@@ -117,17 +117,16 @@ async function collect({
   }
 }
 
-test("uses the rollout session_meta cwd and the Git index for Codex language", async () => {
+test("uses the rollout session_meta cwd, git.branch and Git index for Codex", async () => {
   const home = tempDirectory(), work = tempDirectory();
   try {
     const cwd = repo(work, "codex-repo", ["main.rs", "lib.rs"]);
     // The FileChange names a Python file; the recovered cwd must win instead.
-    writeCodexSession(home, { cwd, files: ["/sentinel/private.py"] });
+    writeCodexSession(home, { cwd, files: ["/sentinel/private.py"], branch: "meta-branch" });
     const { payloads, worker } = await collect({ home, rows: [codexRow()] });
     expect(payloads[0]).toMatchObject({
-      project: "codex-repo", language: "Rust",
+      project: "codex-repo", branch: "meta-branch", language: "Rust",
     });
-    expect(payloads[0].branch).toBeUndefined();
     const cached = JSON.stringify(worker.codexSessions.sessions);
     for (const secret of ["private-instructions", "private-output", "/sentinel/private.py"]) {
       expect(cached).not.toContain(secret);
@@ -139,10 +138,27 @@ test("uses the rollout session_meta cwd and the Git index for Codex language", a
   }
 });
 
+test("falls back to FileChange language when the recovered cwd is not a Git repo", async () => {
+  const home = tempDirectory(), work = tempDirectory();
+  try {
+    // Mirrors the real session with a non-Git OneDrive cwd and payload.git null.
+    const cwd = join(work, "2026-2027_SemA");
+    mkdirSync(cwd, { recursive: true });
+    writeFileSync(join(cwd, "notes.txt"), "");
+    writeCodexSession(home, { cwd, files: ["/sentinel/private.py"], branch: null });
+    const { payloads } = await collect({ home, rows: [codexRow()] });
+    expect(payloads[0]).toMatchObject({ project: "2026-2027_SemA", language: "Python" });
+    expect(payloads[0].branch).toBeUndefined();
+  } finally {
+    rmSync(home, { recursive: true });
+    rmSync(work, { recursive: true });
+  }
+});
+
 test("uses FileChange language when the rollout has no cwd", async () => {
   const home = tempDirectory();
   try {
-    writeCodexSession(home, { cwd: null, files: ["/repo/app.py", "/repo/lib.py"] });
+    writeCodexSession(home, { cwd: null, files: ["/repo/app.py", "/repo/lib.py"], branch: null });
     const { payloads } = await collect({ home, rows: [codexRow()] });
     expect(payloads[0]).toMatchObject({ project: "Magpie", language: "Python" });
   } finally { rmSync(home, { recursive: true }); }
